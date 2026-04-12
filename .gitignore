@@ -1,0 +1,86 @@
+# ===== Secrets & local config =====
+# NEVER commit .env — it contains API keys and local paths
+.env
+.env.*
+!.env.example
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ===== Virtual environments =====
+venv/
+env/
+.venv/
+.env/
+ENV/
+
+# ===== Testing & coverage =====
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# ===== Type checkers / linters =====
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+
+# ===== MarketPulse project-specific =====
+# Local database files (Phase 3 persistence)
+*.db
+*.sqlite
+*.sqlite3
+marketpulse.db
+
+# Simulation output / reports
+output/
+reports/
+logs/
+*.log
+
+# Ollama model cache (if ever downloaded locally)
+models/
+
+# ===== Jupyter / Notebooks =====
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ===== IDEs / Editors =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# ===== OS junk =====
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# ===== Misc =====
+test.py
+*.bak
+*.tmp
