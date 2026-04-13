@@ -1,3 +1,8 @@
+import json
+import re
+from datetime import datetime
+from pathlib import Path
+
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
@@ -14,7 +19,9 @@ from marketpulse.reporting.analyzer import generate_report
 from marketpulse.simulation.interaction import adversarial_pairing
 from marketpulse.simulation.sentiment import apply_persuasion
 
-console = Console()
+# record=True lets us export everything printed as plain text / HTML at end of run.
+# Zero runtime cost, zero LLM token cost.
+console = Console(record=True)
 
 
 class SimulationEngine:
@@ -28,7 +35,10 @@ class SimulationEngine:
     async def initialize_agents(self) -> None:
         """Generate and enrich agent personas."""
         console.print("\n[bold cyan]═══ GENERATING AGENT PERSONAS ═══[/bold cyan]")
-        personas = generate_personas(self.settings.agent_count)
+        personas = generate_personas(
+            self.settings.agent_count,
+            use_hardcoded=self.settings.use_hardcoded_personas,
+        )
 
         with Progress(
             SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
@@ -215,7 +225,41 @@ class SimulationEngine:
         console.print("[bold magenta]╚══════════════════════════════════════════╝[/bold magenta]\n")
         console.print(report)
         results["report"] = report
+
+        # Save run outputs to disk (debate transcript, report, structured summary)
+        self._save_run_outputs(shared, results, report)
+
         return results
+
+    def _save_run_outputs(self, shared: SharedMemory, results: dict, report: str) -> None:
+        """Persist the run to a timestamped folder under runs/.
+
+        Creates three files:
+          - debate.txt  : full terminal transcript (all rounds, all debates)
+          - report.md   : the final marketing report as markdown
+          - summary.json: structured results for later analysis / comparison
+        """
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        product_slug = re.sub(r"[^a-zA-Z0-9]+", "-", shared.product.name).strip("-")
+        run_dir = Path("runs") / f"{timestamp}_{product_slug}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. Full transcript (plain text, no ANSI color codes)
+        (run_dir / "debate.txt").write_text(console.export_text(), encoding="utf-8")
+
+        # 2. Final marketing report as markdown
+        report_md = f"# Marketing Report — {shared.product.name}\n\n_Generated {timestamp}_\n\n{report}\n"
+        (run_dir / "report.md").write_text(report_md, encoding="utf-8")
+
+        # 3. Structured results as JSON
+        (run_dir / "summary.json").write_text(
+            json.dumps(results, indent=2, default=str), encoding="utf-8"
+        )
+
+        console.print(f"\n[bold green]✓ Run saved to:[/bold green] {run_dir}/")
+        console.print(f"  [dim]- debate.txt   (full transcript)[/dim]")
+        console.print(f"  [dim]- report.md    (marketing report)[/dim]")
+        console.print(f"  [dim]- summary.json (structured data)[/dim]")
 
     def _collect_results(self, shared: SharedMemory) -> dict:
         sentiments = [a.sentiment for a in self.agents]

@@ -12,15 +12,31 @@ class Agent:
         self.confidence = 0.8
 
     async def form_opinion(self, shared: SharedMemory, llm: LLMBackend) -> Opinion:
+        # Derive the persona's starting lean from initial_bias so the LLM anchors
+        # its rating around it instead of starting neutral. Without this anchor,
+        # even a "skeptic" archetype drifts to 6/10 because LLMs default to polite.
+        bias_sentiment = self.persona.initial_bias * 5.0  # -5..5 on same scale as output
+        if bias_sentiment > 2:
+            lean = f"You walk in already LIKING this product (starting lean: +{bias_sentiment:.1f})."
+        elif bias_sentiment < -2:
+            lean = f"You walk in already SKEPTICAL of this product (starting lean: {bias_sentiment:.1f})."
+        else:
+            lean = f"You walk in NEUTRAL with mild curiosity (starting lean: {bias_sentiment:+.1f})."
+
         system = (
             f"You are {self.persona.name}, age {self.persona.age}, "
             f"a {self.persona.archetype} consumer. "
             f"{self.persona.personality_blurb} "
-            f"Rate products based on your values and personality."
+            f"STAY IN CHARACTER. Do not be charitable or balanced unless your persona is. "
+            f"If you're a skeptic or bargain_hunter, be critical and blunt. "
+            f"If you're an early_adopter or brand_loyalist, show real enthusiasm."
         )
         user = (
             f"{shared.get_agent_briefing()}\n\n"
-            f"Rate your sentiment toward '{shared.product.name}' from -10 (hate) to 10 (love). "
+            f"{lean} Your final sentiment should usually be within 2 points of that lean "
+            f"unless the product clearly surprises you.\n\n"
+            f"Rate sentiment toward '{shared.product.name}' from -10 (hate) to 10 (love). "
+            f"Most consumers land between -4 and +4 — scores above +7 should be rare and earned. "
             f"List your top 3 concerns and top 3 positives.\n"
             f"Reply as JSON: {{\"sentiment\": <int>, \"concerns\": [\"...\", \"...\", \"...\"], "
             f"\"positives\": [\"...\", \"...\", \"...\"], \"reasoning\": \"...\"}}"
@@ -28,8 +44,12 @@ class Agent:
 
         result = await llm.generate_json(system, user)
 
+        # Blend LLM sentiment with persona bias (70/30) so the bias actually anchors.
+        llm_sentiment = float(result.get("sentiment", 0))
+        blended = 0.7 * llm_sentiment + 0.3 * bias_sentiment
+
         opinion = Opinion(
-            sentiment=float(result.get("sentiment", 0)),
+            sentiment=blended,
             concerns=result.get("concerns", [])[:3],
             positives=result.get("positives", [])[:3],
             reasoning=result.get("reasoning", ""),
@@ -58,7 +78,11 @@ class Agent:
         user = (
             f"Another consumer argues about '{shared.product.name}':\n"
             f"\"{opponent_argument}\"\n\n"
-            f"Do you agree, partially agree, or disagree? How does this change your view?\n"
+            f"Do you agree, partially agree, or disagree? How does this change your view?\n\n"
+            f"Set `convinced: true` ONLY if the argument genuinely flipped your stance "
+            f"(e.g. you were negative and now lean positive, or vice versa). It's okay — "
+            f"and realistic — for ~10-20% of strong arguments to flip a consumer's mind. "
+            f"Don't default to false just to seem consistent; real consumers do change their minds.\n"
             f"Reply as JSON: {{\"stance\": \"agree|partial|disagree\", "
             f"\"counter_argument\": \"your response in 2-3 sentences\", "
             f"\"sentiment_shift\": <int from -3 to 3>, \"convinced\": <true/false>}}"

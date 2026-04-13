@@ -22,9 +22,14 @@ def apply_persuasion(
     debate_result: dict,
     opponent_sentiment: float,
     round_num: int,
-    persuasion_threshold: float = 0.7,
+    persuasion_threshold: float = 0.85,
 ) -> bool:
-    """Apply persuasion mechanics after a debate. Returns True if converted."""
+    """Apply persuasion mechanics after a debate. Returns True if converted.
+
+    Threshold 0.85 means starting confidence (0.8) already qualifies — so any
+    LLM-flagged "convinced" debate converts. Prior 0.7 gate produced zero
+    conversions across full runs because confidence rarely decayed that far.
+    """
     shift = debate_result["sentiment_shift"]
     convinced = debate_result["convinced"]
 
@@ -35,8 +40,8 @@ def apply_persuasion(
     old_sentiment = agent.sentiment
     agent.sentiment = max(-10, min(10, agent.sentiment + effective_shift))
 
-    # Confidence decay on strong counterarguments
-    if abs(shift) > 2:
+    # Confidence decay on meaningful counterarguments (was >2, too strict)
+    if abs(shift) > 1.2:
         agent.confidence *= 0.85
 
     # Conversion check

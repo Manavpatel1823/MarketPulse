@@ -50,6 +50,7 @@ coverage.xml
 marketpulse.db
 
 # Simulation output / reports
+runs/
 output/
 reports/
 logs/
