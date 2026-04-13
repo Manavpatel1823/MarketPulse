@@ -1,12 +1,18 @@
+import argparse
 import asyncio
+from pathlib import Path
 
 from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from marketpulse.config import Settings
 from marketpulse.llm.base import LLMBackend
 from marketpulse.llm.ollama_backend import OllamaBackend
 from marketpulse.llm.openrouter_backend import OpenRouterBackend
-from marketpulse.memory.shared import SharedMemory, ProductInfo, CompetitorInfo
+from marketpulse.memory.shared import ProductInfo, SharedMemory
+from marketpulse.research.coordinator import research_product
+from marketpulse.research.uploader import from_text as upload_from_text
+from marketpulse.research.uploader import from_url as upload_from_url
 from marketpulse.simulation.engine import SimulationEngine
 
 console = Console()
@@ -23,87 +29,109 @@ def build_llm(settings: Settings) -> LLMBackend:
     return OllamaBackend(model=settings.ollama_model, base_url=settings.ollama_base_url)
 
 
-async def main():
-    settings = Settings()
-
-    llm = build_llm(settings)
-
-    # Test case: Fairphone 5 — a genuinely obscure Dutch-made modular phone
-    # (<1% US brand awareness) competing against iPhone + Samsung. Good test of
-    # whether the panel has "big brand halo" bias vs. judging on features alone.
-    shared = SharedMemory(
+def _build_stub(name: str) -> SharedMemory:
+    """Bare-bones SharedMemory when --no-research is used."""
+    return SharedMemory(
         product=ProductInfo(
-            name="Fairphone 5",
-            description=(
-                "A modular, user-repairable Android smartphone from a small Dutch company "
-                "focused on ethical sourcing and longevity. The entire phone can be "
-                "disassembled with a single screwdriver; every major component (battery, "
-                "screen, cameras, USB-C port) is user-replaceable. Backed by a 5-year warranty "
-                "and 10 years of promised software support — vastly longer than mainstream rivals."
-            ),
-            price="$699",
-            features=[
-                "Qualcomm QCM6490 chip (mid-range, ~Snapdragon 778G performance)",
-                "6.46\" 90Hz OLED display",
-                "50MP main camera + 50MP ultrawide",
-                "4,200 mAh USER-REPLACEABLE battery",
-                "Fully modular — swap any part in under 10 minutes",
-                "5-year hardware warranty",
-                "10 years of Android security updates (until 2033)",
-                "Fairtrade-certified gold, 70% recycled materials",
-                "Carbon-neutral manufacturing and shipping",
-                "No pre-installed bloatware; clean Android 13",
-            ],
-            category="Consumer Electronics / Smartphone",
-        ),
-        competitors=[
-            CompetitorInfo(
-                name="Apple iPhone 16",
-                description=(
-                    "Apple's flagship smartphone, dominant in the US premium segment. "
-                    "Massive ecosystem, polished software, industry-leading camera system."
-                ),
-                price="$799",
-                key_features=[
-                    "A18 chip — top-tier performance",
-                    "48MP Fusion camera with spatial video",
-                    "6.1\" Super Retina XDR display, 120Hz ProMotion",
-                    "iOS 18 with Apple Intelligence",
-                    "Deep ecosystem integration (Mac, Watch, AirPods)",
-                    "5+ years of iOS updates (typical)",
-                    "Massive app ecosystem and accessory market",
-                ],
-            ),
-            CompetitorInfo(
-                name="Samsung Galaxy S24",
-                description=(
-                    "Samsung's mainstream flagship. Excellent hardware, strong Android "
-                    "alternative, wide availability."
-                ),
-                price="$799",
-                key_features=[
-                    "Snapdragon 8 Gen 3 — flagship performance",
-                    "50MP main + 10MP 3x telephoto + 12MP ultrawide",
-                    "6.2\" Dynamic AMOLED 2X, 120Hz",
-                    "7 years of OS + security updates",
-                    "Samsung DeX, Galaxy AI features",
-                    "Ubiquitous carrier availability in the US",
-                ],
-            ),
-        ],
-        market_context=(
-            "The US smartphone market is dominated by Apple (~58%) and Samsung (~23%), with "
-            "the remainder split among Google Pixel and small niche players. US consumers "
-            "rarely consider non-US/non-Korean brands for phones. The 'right to repair' "
-            "movement is growing but remains a niche concern. Sustainability-focused phones "
-            "have <2% market share. Most buyers prioritize camera quality, ecosystem fit, "
-            "and trade-in value — areas where small brands struggle. Fairphone has strong "
-            "recognition in the Netherlands and Germany but near-zero awareness in the US."
-        ),
+            name=name,
+            description=f"(no research — running with just the name '{name}')",
+            price="unknown",
+            features=[],
+            category="unknown",
+        )
     )
 
+
+def _print_research_summary(shared: SharedMemory) -> None:
+    console.print("\n[bold cyan]═══ RESEARCH FINDINGS ═══[/bold cyan]")
+    p = shared.product
+    console.print(f"[bold]{p.name}[/bold] — {p.category} — {p.price}")
+    if p.description:
+        console.print(f"[dim]{p.description}[/dim]")
+    if p.features:
+        console.print(f"[dim]Features:[/dim] {', '.join(p.features[:5])}")
+
+    if shared.competitors:
+        console.print("\n[bold]Competitors:[/bold]")
+        for c in shared.competitors:
+            console.print(f"  - {c.name} ({c.price})")
+
+    if shared.signals:
+        s = shared.signals
+        console.print(
+            f"\n[bold]Market signals:[/bold] "
+            f"brand_tier=[magenta]{s.brand_tier}[/magenta], "
+            f"maturity={s.category_maturity}, "
+            f"pricing={s.price_position}"
+        )
+    if shared.research_findings:
+        console.print(f"[dim]{len(shared.research_findings)} findings extracted[/dim]")
+
+
+async def main():
+    ap = argparse.ArgumentParser(description="MarketPulse — AI consumer panel simulation")
+    ap.add_argument("product", help="Product name to research (e.g. 'Fairphone 5')")
+    src = ap.add_mutually_exclusive_group()
+    src.add_argument(
+        "--no-research",
+        action="store_true",
+        help="Skip web research; use a minimal stub (for offline/deterministic testing)",
+    )
+    src.add_argument(
+        "--from-url",
+        metavar="URL",
+        help="Skip web search; fetch this URL, compress its text into ProductInfo via LLM",
+    )
+    src.add_argument(
+        "--from-file",
+        metavar="PATH",
+        help="Skip web search; read this file's text and compress into ProductInfo via LLM",
+    )
+    args = ap.parse_args()
+
+    settings = Settings()
+    llm = build_llm(settings)
+
+    if args.no_research:
+        console.print("[dim]Skipping web research — using stub product.[/dim]")
+        shared = _build_stub(args.product)
+    elif args.from_url:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+            transient=True,
+        ) as progress:
+            progress.add_task(f"Fetching {args.from_url} and extracting product info...", total=None)
+            shared = await upload_from_url(args.product, args.from_url, llm)
+        _print_research_summary(shared)
+    elif args.from_file:
+        path = Path(args.from_file)
+        if not path.is_file():
+            raise SystemExit(f"--from-file: {path} not found or not a file")
+        text = path.read_text(encoding="utf-8", errors="replace")
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+            transient=True,
+        ) as progress:
+            progress.add_task(f"Compressing {path.name} into ProductInfo (1 LLM call)...", total=None)
+            shared = await upload_from_text(args.product, text, llm)
+        _print_research_summary(shared)
+    else:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+            transient=True,
+        ) as progress:
+            progress.add_task(f"Researching '{args.product}' (2 searches + 1 LLM parse)...", total=None)
+            shared = await research_product(args.product, llm)
+        _print_research_summary(shared)
+
     engine = SimulationEngine(settings=settings, llm=llm)
-    results = await engine.run(shared)
+    await engine.run(shared)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,30 @@
 import random
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from marketpulse.memory.shared import MarketSignals
+
+
+# Panel composition by brand tier (positive, neutral, negative fractions).
+# Picked so aggregate sentiment mirrors how real consumers treat each tier:
+#   incumbent     → most buyers defend status quo
+#   challenger    → curious but cautious
+#   unknown       → default skepticism
+#   controversial → hostile majority
+SKEW_BY_TIER: dict[str, tuple[float, float, float]] = {
+    "incumbent":     (0.50, 0.30, 0.20),
+    "challenger":    (0.35, 0.30, 0.35),
+    "unknown":       (0.20, 0.30, 0.50),
+    "controversial": (0.10, 0.25, 0.65),
+}
+DEFAULT_SKEW = SKEW_BY_TIER["unknown"]
+
+
+def _tier_fractions(skew: "MarketSignals | None") -> tuple[float, float, float]:
+    if skew is None:
+        return DEFAULT_SKEW
+    return SKEW_BY_TIER.get(skew.brand_tier, DEFAULT_SKEW)
 
 # Archetype classification (2 positive : 3 neutral : 5 negative)
 # Real markets dominated by incumbents (Apple/Samsung ~81% phone share, etc.) skew
@@ -112,14 +137,19 @@ class Persona:
     initial_bias: float
 
 
-def generate_personas(count: int, use_hardcoded: bool = True) -> list[Persona]:
-    # Prefer hardcoded panel for determinism + faster startup. Select with tier
-    # ratio 2:3:5 (pos:neu:neg) so small panels still reflect real-world skew.
+def generate_personas(
+    count: int,
+    use_hardcoded: bool = True,
+    skew: "MarketSignals | None" = None,
+) -> list[Persona]:
+    # Prefer hardcoded panel for determinism + faster startup. Tier ratio is
+    # chosen from SKEW_BY_TIER via brand_tier — `unknown` (2:3:5) is the fallback.
+    pos_frac, neu_frac, neg_frac = _tier_fractions(skew)
     if use_hardcoded:
         from .hardcoded_personas import HARDCODED_PERSONAS
 
-        pos_n = max(1, round(count * 0.20))
-        neu_n = max(1, round(count * 0.30))
+        pos_n = max(1, round(count * pos_frac))
+        neu_n = max(1, round(count * neu_frac))
         neg_n = count - pos_n - neu_n
 
         buckets = {
@@ -142,23 +172,25 @@ def generate_personas(count: int, use_hardcoded: bool = True) -> list[Persona]:
             selected.extend(buckets[tier][:take])
             deficit += want - take
 
-        # If any tier ran out (e.g. count > 50 wants more negatives than hardcoded has),
-        # pad with procedural generation which also honors the 2:3:5 ratio.
+        # If any tier ran out (e.g. big negative quota > hardcoded pool), pad
+        # with procedural generation honoring the same skew.
         if deficit > 0:
-            selected.extend(_generate_procedural(deficit, offset=len(selected)))
+            selected.extend(_generate_procedural(deficit, offset=len(selected), skew=skew))
 
         return selected
 
-    return _generate_procedural(count, offset=0)
+    return _generate_procedural(count, offset=0, skew=skew)
 
 
-def _generate_procedural(count: int, offset: int = 0) -> list[Persona]:
-    """Generate personas with quota-enforced 2:3:5 (positive:neutral:negative) balance."""
-    # Build an archetype sampling list that preserves tier ratios even for small counts.
-    # Target: 20% positive, 30% neutral, 50% negative — skeptical panel matching
-    # how real consumers react to challenger brands in incumbent-dominated markets.
-    pos_count = max(1, round(count * 0.20))
-    neu_count = max(1, round(count * 0.30))
+def _generate_procedural(
+    count: int,
+    offset: int = 0,
+    skew: "MarketSignals | None" = None,
+) -> list[Persona]:
+    """Generate personas with tier-ratio quotas driven by brand_tier skew."""
+    pos_frac, neu_frac, neg_frac = _tier_fractions(skew)
+    pos_count = max(1, round(count * pos_frac))
+    neu_count = max(1, round(count * neu_frac))
     neg_count = count - pos_count - neu_count
 
     sample_list: list[str] = []

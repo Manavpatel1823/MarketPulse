@@ -32,12 +32,27 @@ class SimulationEngine:
         self.agents: list[Agent] = []
         self.previous_pairs: set[tuple[str, str]] = set()
 
-    async def initialize_agents(self) -> None:
-        """Generate and enrich agent personas."""
+    async def initialize_agents(self, shared: SharedMemory | None = None) -> None:
+        """Generate and enrich agent personas. Panel ratio reflects shared.signals."""
         console.print("\n[bold cyan]═══ GENERATING AGENT PERSONAS ═══[/bold cyan]")
+        skew = shared.signals if shared is not None else None
         personas = generate_personas(
             self.settings.agent_count,
             use_hardcoded=self.settings.use_hardcoded_personas,
+            skew=skew,
+        )
+
+        # Surface which panel ratio was chosen so the user can sanity-check it.
+        from collections import Counter
+        from marketpulse.agents.persona import ARCHETYPE_TIERS
+        tier_of = {a: t for t, archs in ARCHETYPE_TIERS.items() for a in archs}
+        tier_counts = Counter(tier_of.get(p.archetype, "?") for p in personas)
+        tier_label = skew.brand_tier if skew else "default"
+        console.print(
+            f"[dim]Panel ({tier_label}): "
+            f"{tier_counts.get('positive', 0)} pos / "
+            f"{tier_counts.get('neutral', 0)} neu / "
+            f"{tier_counts.get('negative', 0)} neg[/dim]"
         )
 
         with Progress(
@@ -194,10 +209,16 @@ class SimulationEngine:
         console.print("[bold magenta]╚══════════════════════════════════════╝[/bold magenta]")
         console.print(f"Product: [bold]{shared.product.name}[/bold]")
         console.print(f"Agents: {self.settings.agent_count} | Rounds: {self.settings.rounds}")
-        console.print(f"Backend: {self.settings.backend} ({self.settings.ollama_model})")
+        # Show the model string for whichever backend is actually active
+        active_model = {
+            "openrouter": self.settings.openrouter_model,
+            "ollama": self.settings.ollama_model,
+            "gemini": getattr(self.settings, "gemini_model", "gemini-2.5-flash"),
+        }.get(self.settings.backend, self.settings.ollama_model)
+        console.print(f"Backend: {self.settings.backend} ({active_model})")
 
         # Phase 1: Initialize agents
-        await self.initialize_agents()
+        await self.initialize_agents(shared)
 
         # Phase 2: Form initial opinions
         await self.opinion_phase(shared)

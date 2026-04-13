@@ -27,11 +27,24 @@ class ResearchFinding:
 
 
 @dataclass
+class MarketSignals:
+    """How the market treats this product — drives panel composition.
+
+    `brand_tier` is the only field v1 uses for panel skew. The other two are
+    stored for future work (archetype-within-tier weighting).
+    """
+    brand_tier: str        # "incumbent" | "challenger" | "unknown" | "controversial"
+    category_maturity: str # "emerging" | "established" | "saturated"
+    price_position: str    # "premium" | "parity" | "budget"
+
+
+@dataclass
 class SharedMemory:
     product: ProductInfo
     competitors: list[CompetitorInfo] = field(default_factory=list)
     research_findings: list[ResearchFinding] = field(default_factory=list)
     market_context: str = ""
+    signals: MarketSignals | None = None
 
     def get_agent_briefing(self) -> str:
         lines = [
