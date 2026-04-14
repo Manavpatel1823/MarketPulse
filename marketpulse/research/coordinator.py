@@ -89,3 +89,83 @@ async def research_product(name: str, llm) -> SharedMemory:
         market_context=extracted.market_context,
         signals=extracted.signals,
     )
+
+
+async def augment_with_category_competitors(
+    shared: SharedMemory,
+    llm,
+    max_extra: int = 3,
+) -> SharedMemory:
+    """For brief-uploaded products: search the web by CATEGORY (not name)
+    to find real competitors. The brief tells us what the product *is*;
+    the web tells us who it competes against in that space.
+
+    No-op if the brief had no category, or already has 3+ competitors.
+    Modifies and returns `shared` for caller convenience.
+    """
+    category = (shared.product.category or "").strip()
+    if not category:
+        return shared
+    if len(shared.competitors) >= 3:
+        return shared
+
+    queries = [
+        f"top {category} brands 2026",
+        f"best {category} review comparison",
+    ]
+    snippets = []
+    for q in queries:
+        try:
+            batch = await asyncio.wait_for(
+                searcher.search(q, max_results=4),
+                timeout=12.0,
+            )
+            snippets.extend(batch)
+        except asyncio.TimeoutError:
+            print(f"  [search timeout] {q!r}")
+        await asyncio.sleep(0.5)
+
+    if not snippets:
+        return shared
+
+    # One small LLM call: extract competitors from category snippets,
+    # excluding the product itself.
+    snippet_block = "\n".join(
+        f"[{i}] {s.title} — {(s.snippet or '')[:160]}"
+        for i, s in enumerate(snippets[:8], 1)
+    )
+    existing = {c.name.lower() for c in shared.competitors}
+    existing.add(shared.product.name.lower())
+
+    system = (
+        "You extract real competitor brands/products from web search snippets. "
+        "Be conservative — only list names that consumers would actually "
+        "cross-shop. Skip aggregators, listicles-as-brands, and irrelevant hits."
+    )
+    user = (
+        f"Category: {category}\n"
+        f"Excluded (already known or is the product itself): "
+        f"{', '.join(sorted(existing))}\n\n"
+        f"Snippets:\n{snippet_block}\n\n"
+        f"Return JSON: {{\"competitors\": ["
+        '{"name": str, "price": str, "key_features": [str], "description": str}, ...'
+        f"]}}\n"
+        f"Limit to {max_extra} entries. Skip anything in the excluded list."
+    )
+
+    try:
+        raw = await llm.generate_json(system, user)
+    except Exception as e:
+        print(f"  [augment_competitors] LLM call failed: {e}")
+        return shared
+
+    new_competitors = []
+    for c in (raw.get("competitors", []) or [])[:max_extra]:
+        nm = (c.get("name") or "").strip()
+        if not nm or nm.lower() in existing:
+            continue
+        new_competitors.append(_competitor_from_extracted(c))
+        existing.add(nm.lower())
+
+    shared.competitors.extend(new_competitors)
+    return shared

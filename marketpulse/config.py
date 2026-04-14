@@ -28,4 +28,6 @@ class Settings(BaseSettings):
 
     use_hardcoded_personas: bool = True
 
-    db_path: str = "marketpulse.db"
+    # PostgreSQL persistence
+    database_url: str = "postgresql://manav:postgres@localhost:5432/marketpulse"
+    persist_db: bool = True

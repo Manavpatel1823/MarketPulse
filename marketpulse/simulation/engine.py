@@ -18,6 +18,7 @@ from marketpulse.memory.shared import SharedMemory
 from marketpulse.reporting.analyzer import generate_report
 from marketpulse.simulation.interaction import adversarial_pairing
 from marketpulse.simulation.sentiment import apply_persuasion
+from marketpulse.storage import db as storage
 
 # record=True lets us export everything printed as plain text / HTML at end of run.
 # Zero runtime cost, zero LLM token cost.
@@ -31,6 +32,10 @@ class SimulationEngine:
         self.pool = AgentPool(batch_size=settings.batch_size)
         self.agents: list[Agent] = []
         self.previous_pairs: set[tuple[str, str]] = set()
+        # DB state — populated in run() if persist_db=True. None means "no DB".
+        self._db_pool = None
+        self._run_id: int | None = None
+        self._agent_db_ids: dict[str, int] = {}
 
     async def initialize_agents(self, shared: SharedMemory | None = None) -> None:
         """Generate and enrich agent personas. Panel ratio reflects shared.signals."""
@@ -217,42 +222,124 @@ class SimulationEngine:
         }.get(self.settings.backend, self.settings.ollama_model)
         console.print(f"Backend: {self.settings.backend} ({active_model})")
 
-        # Phase 1: Initialize agents
-        await self.initialize_agents(shared)
+        # Pre-compute the folder name now so DB and disk agree on the slug.
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        product_slug = re.sub(r"[^a-zA-Z0-9]+", "-", shared.product.name).strip("-")
+        folder_name = f"{timestamp}_{product_slug}"
 
-        # Phase 2: Form initial opinions
-        await self.opinion_phase(shared)
+        # Open DB + create run row up-front so even partial runs are recorded.
+        if self.settings.persist_db:
+            try:
+                self._db_pool = await storage.get_pool(self.settings.database_url)
+                self._run_id = await storage.insert_run(
+                    self._db_pool,
+                    product_name=shared.product.name,
+                    folder_name=folder_name,
+                    agent_count=self.settings.agent_count,
+                    rounds=self.settings.rounds,
+                    backend=self.settings.backend,
+                    model=active_model,
+                    settings_dict=self.settings.model_dump(mode="json", exclude={"marketpulse_api", "gemini_api_key", "database_url"}),
+                )
+                await storage.insert_shared_memory(self._db_pool, self._run_id, shared)
+                console.print(f"[dim][db] Persisting as run #{self._run_id}[/dim]")
+            except Exception as e:
+                console.print(f"[yellow][db] Disabled — {type(e).__name__}: {e}[/yellow]")
+                self._db_pool = None
+                self._run_id = None
 
-        # Phase 3: Debate rounds
-        for round_num in range(self.settings.rounds):
-            await self.debate_round(shared, round_num)
+        try:
+            # Phase 1: Initialize agents
+            await self.initialize_agents(shared)
+            if self._db_pool and self._run_id:
+                self._agent_db_ids = await storage.insert_agents(
+                    self._db_pool, self._run_id, self.agents
+                )
 
-        # Collect results
-        results = self._collect_results(shared)
-        self._print_final_summary(results)
+            # Phase 2: Form initial opinions
+            await self.opinion_phase(shared)
+            await self._persist_round_opinions(round_num=0)
 
-        # Phase 4: Generate marketing report
-        console.print("\n[bold cyan]═══ GENERATING MARKETING REPORT ═══[/bold cyan]")
-        with Progress(
-            SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
-            console=console,
-        ) as progress:
-            ptask = progress.add_task("Reasoning agent analyzing all data...", total=None)
-            report = await generate_report(results, self.llm)
-            progress.update(ptask, completed=True)
+            # Phase 3: Debate rounds
+            for round_num in range(self.settings.rounds):
+                await self.debate_round(shared, round_num)
+                await self._persist_round_opinions(round_num=round_num + 1)
 
-        console.print("\n[bold magenta]╔══════════════════════════════════════════╗[/bold magenta]")
-        console.print("[bold magenta]║   MARKETING INTELLIGENCE REPORT          ║[/bold magenta]")
-        console.print("[bold magenta]╚══════════════════════════════════════════╝[/bold magenta]\n")
-        console.print(report)
-        results["report"] = report
+            # Collect results
+            results = self._collect_results(shared)
+            self._print_final_summary(results)
 
-        # Save run outputs to disk (debate transcript, report, structured summary)
-        self._save_run_outputs(shared, results, report)
+            # Phase 4: Generate marketing report
+            console.print("\n[bold cyan]═══ GENERATING MARKETING REPORT ═══[/bold cyan]")
+            with Progress(
+                SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                console=console,
+            ) as progress:
+                ptask = progress.add_task("Reasoning agent analyzing all data...", total=None)
+                report = await generate_report(results, shared, self.llm)
+                progress.update(ptask, completed=True)
 
-        return results
+            console.print("\n[bold magenta]╔══════════════════════════════════════════╗[/bold magenta]")
+            console.print("[bold magenta]║   MARKETING INTELLIGENCE REPORT          ║[/bold magenta]")
+            console.print("[bold magenta]╚══════════════════════════════════════════╝[/bold magenta]\n")
+            console.print(report)
+            results["report"] = report
 
-    def _save_run_outputs(self, shared: SharedMemory, results: dict, report: str) -> None:
+            # Save run outputs to disk (debate transcript, report, structured summary)
+            self._save_run_outputs(shared, results, report, folder_name)
+
+            # Finalize DB row last — only "complete" if everything succeeded.
+            await self._finalize_db(results)
+
+            return results
+        finally:
+            # Connection pool stays alive for the process; nothing to close
+            # per-run. close_pool() is the program-exit hook.
+            pass
+
+    async def _persist_round_opinions(self, round_num: int) -> None:
+        if not (self._db_pool and self._run_id):
+            return
+        rows = []
+        for a in self.agents:
+            db_id = self._agent_db_ids.get(a.persona.id)
+            if db_id is None:
+                continue
+            rows.append((db_id, round_num, a.memory.latest_opinion))
+        await storage.insert_opinions_batch(self._db_pool, self._run_id, rows)
+
+    async def _finalize_db(self, results: dict) -> None:
+        if not (self._db_pool and self._run_id):
+            return
+        agent_finals: dict[int, tuple[float, int, float]] = {}
+        for a in self.agents:
+            db_id = self._agent_db_ids.get(a.persona.id)
+            if db_id is None:
+                continue
+            init = a.memory.sentiment_history[0] if a.memory.sentiment_history else 0.0
+            agent_finals[db_id] = (
+                round(a.sentiment, 2),
+                len(a.memory.conversion_events),
+                round(init, 2),
+            )
+        dist = results.get("distribution", {})
+        await storage.finalize_run(
+            self._db_pool,
+            self._run_id,
+            mean_sentiment=results["average_sentiment"],
+            polarization=dist.get("polarization_index", 0.0),
+            distribution=dist,
+            total_conversions=results["total_conversions"],
+            brand_tier=(results.get("brand_tier")),
+            agent_finals=agent_finals,
+        )
+        if results.get("report"):
+            await storage.insert_report(self._db_pool, self._run_id, results["report"])
+
+    def _save_run_outputs(
+        self, shared: SharedMemory, results: dict, report: str,
+        folder_name: str | None = None,
+    ) -> None:
         """Persist the run to a timestamped folder under runs/.
 
         Creates three files:
@@ -260,10 +347,13 @@ class SimulationEngine:
           - report.md   : the final marketing report as markdown
           - summary.json: structured results for later analysis / comparison
         """
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        product_slug = re.sub(r"[^a-zA-Z0-9]+", "-", shared.product.name).strip("-")
-        run_dir = Path("runs") / f"{timestamp}_{product_slug}"
+        if folder_name is None:
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            product_slug = re.sub(r"[^a-zA-Z0-9]+", "-", shared.product.name).strip("-")
+            folder_name = f"{timestamp}_{product_slug}"
+        run_dir = Path("runs") / folder_name
         run_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = folder_name.split("_", 1)[0]
 
         # 1. Full transcript (plain text, no ANSI color codes)
         (run_dir / "debate.txt").write_text(console.export_text(), encoding="utf-8")
@@ -282,9 +372,43 @@ class SimulationEngine:
         console.print(f"  [dim]- report.md    (marketing report)[/dim]")
         console.print(f"  [dim]- summary.json (structured data)[/dim]")
 
+    @staticmethod
+    def _distribution(sentiments: list[float]) -> dict:
+        """Bucket sentiments into 5 bands + compute polarization.
+
+        Buckets follow the -10..+10 sentiment scale used everywhere else.
+        polarization_index = fraction of agents at the extremes (|s| >= 7).
+        A high mean with high polarization is a marketing red flag —
+        "love-it-or-hate-it" hides behind a moderate average.
+        """
+        if not sentiments:
+            return {"buckets": {}, "polarization_index": 0.0, "quartiles": []}
+        bands = [
+            ("hostile (-10..-7)", -10, -7),
+            ("negative (-7..-3)", -7, -3),
+            ("neutral (-3..+3)", -3, 3),
+            ("positive (+3..+7)", 3, 7),
+            ("enthusiast (+7..+10)", 7, 10.0001),  # inclusive upper
+        ]
+        buckets = {}
+        n = len(sentiments)
+        for label, lo, hi in bands:
+            count = sum(1 for s in sentiments if lo <= s < hi)
+            buckets[label] = {"count": count, "pct": round(100 * count / n, 1)}
+        extreme = sum(1 for s in sentiments if abs(s) >= 7)
+        polarization = round(100 * extreme / n, 1)
+        srt = sorted(sentiments)
+        q = lambda f: round(srt[min(len(srt) - 1, int(len(srt) * f))], 2)
+        return {
+            "buckets": buckets,
+            "polarization_index": polarization,
+            "quartiles": [q(0.25), q(0.50), q(0.75)],
+        }
+
     def _collect_results(self, shared: SharedMemory) -> dict:
         sentiments = [a.sentiment for a in self.agents]
         avg = sum(sentiments) / len(sentiments) if sentiments else 0
+        distribution = self._distribution(sentiments)
 
         all_concerns = []
         all_positives = []
@@ -313,10 +437,12 @@ class SimulationEngine:
 
         return {
             "product": shared.product.name,
+            "brand_tier": shared.signals.brand_tier if shared.signals else None,
             "agent_count": len(self.agents),
             "rounds": self.settings.rounds,
             "average_sentiment": round(avg, 2),
             "sentiment_range": (round(min(sentiments), 2), round(max(sentiments), 2)),
+            "distribution": distribution,
             "total_conversions": total_conversions,
             "top_concerns": sorted(concern_freq.items(), key=lambda x: -x[1])[:5],
             "top_positives": sorted(positive_freq.items(), key=lambda x: -x[1])[:5],
@@ -363,10 +489,19 @@ class SimulationEngine:
 
     def _print_final_summary(self, results: dict) -> None:
         console.print("\n[bold magenta]═══ SIMULATION COMPLETE ═══[/bold magenta]")
-        console.print(f"Average Sentiment: [bold]{results['average_sentiment']}/10[/bold]")
-        console.print(
-            f"Range: {results['sentiment_range'][0]} to {results['sentiment_range'][1]}"
-        )
+        # Distribution leads, mean is supplementary — see Phase 2c #1.
+        dist = results.get("distribution", {})
+        if dist.get("buckets"):
+            console.print("[bold]Sentiment Distribution:[/bold]")
+            for label, info in dist["buckets"].items():
+                bar = "█" * int(info["pct"] / 4)
+                console.print(f"  {label:<22} {info['count']:>3} agents ({info['pct']:>4.1f}%) {bar}")
+            q = dist.get("quartiles", [])
+            if q:
+                console.print(f"[dim]Quartiles (Q1/median/Q3): {q[0]} / {q[1]} / {q[2]}[/dim]")
+            console.print(f"[dim]Polarization index: {dist['polarization_index']}% at extremes (|s|≥7)[/dim]")
+        console.print(f"\nMean (supplementary): {results['average_sentiment']}/10  "
+                      f"[dim]range {results['sentiment_range'][0]} to {results['sentiment_range'][1]}[/dim]")
         console.print(f"Total Conversions: {results['total_conversions']}")
 
         if results["top_concerns"]:

@@ -134,8 +134,11 @@ async def from_text(name: str, text: str, llm) -> SharedMemory:
         "- findings: 3-5 entries reflecting plausible third-party reactions to the "
         "described features (mix of sentiments, not all positive).\n"
         "- market_context: 2-3 sentences on the market this product enters.\n"
-        "- brand_tier: assume 'unknown' unless the source clearly indicates an "
-        "established brand. Source-self-praise is NOT evidence of incumbency."
+        "- brand_tier: judge from the PRODUCT NAME's real-world recognition "
+        "(Tesla/Apple/Samsung = incumbent; OnePlus/Rivian = challenger; "
+        "names you don't recognize = unknown). Do NOT infer tier from the "
+        "source's tone — self-praise is not evidence of incumbency, but a "
+        "well-known brand stays well-known regardless of how the source reads."
     )
 
     raw: dict[str, Any] = await llm.generate_json(system, user)

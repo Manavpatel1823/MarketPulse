@@ -4,6 +4,18 @@ from marketpulse.memory.individual import AgentMemory, Opinion, InteractionRecor
 from marketpulse.memory.shared import SharedMemory
 
 
+# Brand-tier skew applied on top of persona.initial_bias (-1..1 scale).
+# Rationale: an Apple launch walks in with reputation equity a no-name startup
+# lacks — the same persona evaluates them with a different prior. Kept small
+# (<=0.2) so strong research negatives can still override it.
+_BRAND_TIER_BIAS = {
+    "incumbent": 0.20,
+    "challenger": 0.10,
+    "unknown": 0.00,
+    "controversial": -0.20,
+}
+
+
 class Agent:
     def __init__(self, persona: Persona):
         self.persona = persona
@@ -12,16 +24,23 @@ class Agent:
         self.confidence = 0.8
 
     async def form_opinion(self, shared: SharedMemory, llm: LLMBackend) -> Opinion:
-        # Derive the persona's starting lean from initial_bias so the LLM anchors
-        # its rating around it instead of starting neutral. Without this anchor,
-        # even a "skeptic" archetype drifts to 6/10 because LLMs default to polite.
-        bias_sentiment = self.persona.initial_bias * 5.0  # -5..5 on same scale as output
+        tier = shared.signals.brand_tier if shared.signals else "unknown"
+        tier_skew = _BRAND_TIER_BIAS.get(tier, 0.0)
+        effective_bias = max(-1.0, min(1.0, self.persona.initial_bias + tier_skew))
+        bias_sentiment = effective_bias * 5.0  # -5..5 on same scale as output
         if bias_sentiment > 2:
             lean = f"You walk in already LIKING this product (starting lean: +{bias_sentiment:.1f})."
         elif bias_sentiment < -2:
             lean = f"You walk in already SKEPTICAL of this product (starting lean: {bias_sentiment:.1f})."
         else:
             lean = f"You walk in NEUTRAL with mild curiosity (starting lean: {bias_sentiment:+.1f})."
+
+        if tier == "incumbent":
+            lean += " The brand is a proven incumbent — reputation earns it the benefit of the doubt on quality, but hold the line on price and over-promising."
+        elif tier == "controversial":
+            lean += " The brand carries real baggage — be blunt about past issues, don't let marketing language paper over them."
+        elif tier == "unknown":
+            lean += " The brand is unproven — no reputation to lean on, so judge strictly on what the product actually delivers."
 
         system = (
             f"You are {self.persona.name}, age {self.persona.age}, "

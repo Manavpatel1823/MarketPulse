@@ -67,6 +67,48 @@ brew services stop ollama
 
 ---
 
+## CLI Commands
+
+`run.py` takes a product name (positional) plus optional flags that control how product context is sourced and how the simulation starts.
+
+### Running a Simulation
+
+| Command | What it does |
+|---------|--------------|
+| `python3 run.py "Fairphone 5"` | Default run. Checks the research **gate** (is web research worthwhile?), then uses DuckDuckGo to pull snippets, builds `SharedMemory`, and pauses for a confirmation prompt before the simulation starts. |
+| `python3 run.py "MyProduct" --from-file brief.txt` | Skip web search for the product. One LLM call compresses your brief into `ProductInfo` + competitors + signals. The inferred **category** is then web-searched for real competitors. Use for unreleased / pre-launch / internal products with no web footprint. |
+| `python3 run.py "MyProduct" --from-url https://example.com/product` | Same as `--from-file` but fetches a URL, strips HTML, then compresses. Good for official product pages, press releases, or Wikipedia entries. |
+| `python3 run.py "MyProduct" --no-research` | Fully offline. No LLM research at all — uses a deterministic stub product. Fastest path for testing the simulation engine itself. |
+| `python3 run.py "Fairphone 5" --force-research` | Bypass the research gate and always run the web search, even if the gate would have skipped it. |
+| `python3 run.py "Fairphone 5" -y` | Auto-confirm the "proceed with these findings?" prompt. Use in CI or scripting. |
+
+Flags can be combined, e.g. `python3 run.py "Fairphone 5" --force-research -y`.
+
+### Inspecting Past Runs (no simulation)
+
+These read from Postgres (Phase 3 persistence layer) — no LLM calls.
+
+| Command | What it does |
+|---------|--------------|
+| `python3 run.py --list` | Show recent runs: ID, product, agent count, mean sentiment, timestamp. Incomplete (crashed mid-run) entries are flagged. |
+| `python3 run.py --show 7` | Full detail of run #7: product info, signals, sentiment distribution, concerns, final report. |
+| `python3 run.py --compare 3 7` | Side-by-side comparison of two or more run IDs. Useful for A/B comparing product variants or re-runs. |
+
+### Flag Reference
+
+| Flag | Purpose |
+|------|---------|
+| `--from-file PATH` | Use a local text file as the product source (skips product-name web search). |
+| `--from-url URL` | Fetch a URL and use its text content as the product source. |
+| `--no-research` | Disable all LLM-driven research; run with a minimal stub product. |
+| `--force-research` | Skip the gate's "is research worthwhile?" pre-check. |
+| `-y` | Auto-confirm prompts (non-interactive). |
+| `--list` | List past runs from the database, then exit. |
+| `--show ID` | Show a single past run in detail, then exit. |
+| `--compare ID [ID ...]` | Compare 2+ past runs, then exit. |
+
+---
+
 ## Project Structure & File Guide
 
 ```
