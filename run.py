@@ -12,6 +12,7 @@ from marketpulse.llm.openrouter_backend import OpenRouterBackend
 from marketpulse.memory.shared import ProductInfo, SharedMemory
 from marketpulse.research.coordinator import (
     augment_with_category_competitors,
+    enrich_competitor_briefs,
     research_product,
 )
 from marketpulse.research.gate import is_research_worthwhile
@@ -119,6 +120,10 @@ async def main():
                     help="Show full detail for one run from the database and exit.")
     ap.add_argument("--compare", type=int, nargs="+", metavar="RUN_ID",
                     help="Compare 2+ runs side-by-side and exit.")
+    ap.add_argument("--serve", action="store_true",
+                    help="Start the visualization API on localhost:8000 and exit.")
+    ap.add_argument("--port", type=int, default=8000,
+                    help="Port for --serve (default: 8000).")
     src = ap.add_mutually_exclusive_group()
     src.add_argument(
         "--no-research",
@@ -147,6 +152,23 @@ async def main():
     )
     args = ap.parse_args()
     settings = Settings()
+
+    # ── Serve mode: boot FastAPI + exit (no sim, no LLM) ───────────────
+    if args.serve:
+        import uvicorn
+        console.print(
+            f"[bold cyan]Starting MarketPulse API on "
+            f"http://localhost:{args.port}[/bold cyan]"
+        )
+        console.print("[dim]Vite frontend dev server: cd frontend && npm run dev[/dim]")
+        config = uvicorn.Config(
+            "marketpulse.api.app:app",
+            host="127.0.0.1",
+            port=args.port,
+            log_level="info",
+        )
+        await uvicorn.Server(config).serve()
+        return
 
     # ── DB inspection mode (no sim, no LLM) ────────────────────────────
     if args.list_runs or args.show is not None or args.compare:
@@ -191,6 +213,8 @@ async def main():
             shared = await upload_from_url(args.product, args.from_url, llm)
             progress.add_task(f"Finding {shared.product.category or 'category'} competitors on web...", total=None)
             shared = await augment_with_category_competitors(shared, llm)
+            progress.add_task("Writing competitor positioning briefs (1 LLM call)...", total=None)
+            shared = await enrich_competitor_briefs(shared, llm)
         _print_research_summary(shared)
     elif args.from_file:
         path = Path(args.from_file)
@@ -207,6 +231,8 @@ async def main():
             shared = await upload_from_text(args.product, text, llm)
             progress.add_task(f"Finding {shared.product.category or 'category'} competitors on web...", total=None)
             shared = await augment_with_category_competitors(shared, llm)
+            progress.add_task("Writing competitor positioning briefs (1 LLM call)...", total=None)
+            shared = await enrich_competitor_briefs(shared, llm)
         _print_research_summary(shared)
     else:
         # Phase 2c #2: gate the full pipeline behind a "worth it?" pre-check.
@@ -249,6 +275,8 @@ async def main():
         ) as progress:
             progress.add_task(f"Researching '{args.product}' (2 searches + 1 LLM parse)...", total=None)
             shared = await research_product(args.product, llm)
+            progress.add_task("Writing competitor positioning briefs (1 LLM call)...", total=None)
+            shared = await enrich_competitor_briefs(shared, llm)
         _print_research_summary(shared)
 
     # Confirmation gate (skipped for --no-research since there's nothing

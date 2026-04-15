@@ -16,8 +16,11 @@ def _product_from_extracted(name: str, raw: dict) -> ProductInfo:
         name=name,
         description=raw.get("description", "") or "",
         price=raw.get("price", "") or "",
-        features=list(raw.get("features", []) or [])[:10],
+        features=list(raw.get("features", []) or [])[:15],
         category=raw.get("category", "") or "",
+        detailed_description=(raw.get("detailed_description") or "").strip(),
+        risks=[r for r in (raw.get("risks") or []) if r][:6],
+        target_audience=(raw.get("target_audience") or "").strip(),
     )
 
 
@@ -27,7 +30,100 @@ def _competitor_from_extracted(raw: dict) -> CompetitorInfo:
         description=raw.get("description", "") or "",
         price=raw.get("price", "") or "",
         key_features=list(raw.get("key_features", []) or [])[:6],
+        positioning=(raw.get("positioning") or "").strip(),
     )
+
+
+async def enrich_competitor_briefs(shared: SharedMemory, llm) -> SharedMemory:
+    """Search each competitor on the web, then run ONE LLM call that writes
+    comparative positioning briefs grounded in the real snippets.
+
+    For every competitor without a positioning: 1 DDG search (sequential,
+    throttled — DDG rate-limits parallels). Snippets feed the LLM so the
+    brief references real features/prices/reviews, not hallucinated ones.
+    Skips any competitor that already has a positioning string.
+    """
+    todo = [c for c in shared.competitors if not c.positioning]
+    if not todo:
+        return shared
+
+    category = shared.product.category or ""
+    snippets_by_name: dict[str, list] = {}
+    for c in todo:
+        query = f"{c.name} {category} features review price".strip()
+        try:
+            batch = await asyncio.wait_for(
+                searcher.search(query, max_results=3),
+                timeout=10.0,
+            )
+            snippets_by_name[c.name] = batch
+        except asyncio.TimeoutError:
+            print(f"  [enrich_competitors] search timeout for {c.name!r}")
+            snippets_by_name[c.name] = []
+        await asyncio.sleep(0.5)  # DDG politeness
+
+    def _snip_block(c: CompetitorInfo) -> str:
+        ss = snippets_by_name.get(c.name, [])
+        if not ss:
+            return "  (no web snippets available)"
+        return "\n".join(
+            f"  [{i}] {s.title} — {(s.snippet or '')[:200]}"
+            for i, s in enumerate(ss, 1)
+        )
+
+    comp_block = "\n".join(
+        f"== {c.name} ({c.price or 'price unknown'}) ==\n"
+        f"  declared features: {', '.join(c.key_features) or c.description or 'none listed'}\n"
+        f"  web snippets:\n{_snip_block(c)}"
+        for c in todo
+    )
+    system = (
+        "You write competitor positioning briefs for a market-research panel. "
+        "Ground every brief in the web snippets — cite concrete features, specs, "
+        "or prices from the snippets where available. Name trade-offs bluntly; "
+        "no marketing fluff, no hedges."
+    )
+    user = (
+        f"Product under study: {shared.product.name} "
+        f"({category or 'unknown category'}).\n"
+        f"Our product's features: {', '.join(shared.product.features[:10]) or 'unspecified'}.\n\n"
+        f"Competitors to brief:\n{comp_block}\n\n"
+        'Return JSON: {"briefs": [{"name": str, "positioning": str, '
+        '"overlapping_features": [str, ...]}, ...]}\n'
+        "For each competitor:\n"
+        "- positioning: 60-90 words covering strengths, weaknesses, target buyer, "
+        "and price anchor vs. the category. Be comparative — call out where this "
+        "competitor beats or loses to the product under study on specific features.\n"
+        "- overlapping_features: 2-5 concrete features this competitor shares with "
+        "the product under study (so debaters can argue 'X already has this for less')."
+    )
+
+    try:
+        raw = await llm.generate_json(system, user)
+    except Exception as e:
+        print(f"  [enrich_competitors] LLM call failed: {e}")
+        return shared
+
+    by_name = {
+        (b.get("name") or "").strip().lower(): b
+        for b in (raw.get("briefs") or [])
+    }
+    for c in todo:
+        entry = by_name.get(c.name.strip().lower())
+        if not entry:
+            continue
+        pos = (entry.get("positioning") or "").strip()
+        if pos:
+            c.positioning = pos
+        overlap = [f for f in (entry.get("overlapping_features") or []) if f][:5]
+        if overlap:
+            # Merge overlap into key_features without dupes, preserving order.
+            existing = {f.lower() for f in c.key_features}
+            for f in overlap:
+                if f.lower() not in existing:
+                    c.key_features.append(f)
+                    existing.add(f.lower())
+    return shared
 
 
 def _finding_from_extracted(raw: dict) -> ResearchFinding:

@@ -32,7 +32,7 @@ from marketpulse.research.parser import (
 
 # Cap input text so the prompt stays under the 600-token convention even
 # if the user pastes a 50-page brief.
-MAX_INPUT_CHARS = 6000
+MAX_INPUT_CHARS = 10000
 
 
 class _TextExtractor(HTMLParser):
@@ -116,7 +116,8 @@ async def from_text(name: str, text: str, llm) -> SharedMemory:
         f"Source material:\n{text}\n\n"
         "Extract and return JSON with EXACTLY these keys:\n"
         "{\n"
-        '  "product": {"description": str, "price": str, "features": [str, ...], "category": str},\n'
+        '  "product": {"description": str, "detailed_description": str, "price": str, '
+        '"features": [str, ...], "category": str, "risks": [str, ...], "target_audience": str},\n'
         '  "competitors": [{"name": str, "price": str, "key_features": [str], "description": str}, ...],\n'
         '  "findings": [{"source": str, "summary": str, "sentiment": "positive"|"neutral"|"negative", "category": str}, ...],\n'
         '  "market_context": str,\n'
@@ -128,7 +129,16 @@ async def from_text(name: str, text: str, llm) -> SharedMemory:
         "}\n\n"
         "Guidance:\n"
         "- description: 1-2 sentence neutral summary (NOT a tagline).\n"
-        "- features: 5-10 concrete product features.\n"
+        "- detailed_description: 4-6 sentence overview covering value proposition, "
+        "what makes it differentiated, and the concrete use cases it serves. Pull real "
+        "details from the source — do NOT paraphrase into marketing platitudes.\n"
+        "- features: 8-15 concrete product features — be specific (specs, capabilities, "
+        "build details), not marketing adjectives.\n"
+        "- risks: 3-6 honest limitations, trade-offs, or weaknesses. Include ones "
+        "explicitly named in the source AND ones a skeptic would raise. Each risk "
+        "must be specific to this product (e.g. 'battery drains in cold weather', "
+        "not 'quality concerns').\n"
+        "- target_audience: 1-2 sentences on who this product is for.\n"
         "- competitors: 2-3 real products this would be cross-shopped against. "
         "Infer them from the product category — the source likely won't name them.\n"
         "- findings: 3-5 entries reflecting plausible third-party reactions to the "
@@ -148,8 +158,11 @@ async def from_text(name: str, text: str, llm) -> SharedMemory:
         name=name,
         description=p_raw.get("description", "") or "",
         price=p_raw.get("price", "") or "",
-        features=list(p_raw.get("features", []) or [])[:10],
+        features=list(p_raw.get("features", []) or [])[:15],
         category=p_raw.get("category", "") or "",
+        detailed_description=(p_raw.get("detailed_description") or "").strip(),
+        risks=[r for r in (p_raw.get("risks") or []) if r][:6],
+        target_audience=(p_raw.get("target_audience") or "").strip(),
     )
 
     competitors = []

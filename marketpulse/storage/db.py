@@ -90,10 +90,27 @@ CREATE TABLE IF NOT EXISTS reports (
     generated_at    TIMESTAMPTZ NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS interactions (
+    id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    run_id          BIGINT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    round_num       INTEGER NOT NULL,
+    agent_a_id      BIGINT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    agent_b_id      BIGINT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    a_stance        TEXT,
+    b_stance        TEXT,
+    a_shift         DOUBLE PRECISION,
+    b_shift         DOUBLE PRECISION,
+    a_convinced     BOOLEAN,
+    b_convinced     BOOLEAN,
+    a_argument      TEXT,
+    b_argument      TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_runs_product  ON runs(product_name);
 CREATE INDEX IF NOT EXISTS idx_runs_started  ON runs(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_opinions_run_round ON opinions(run_id, round_num);
 CREATE INDEX IF NOT EXISTS idx_agents_run    ON agents(run_id);
+CREATE INDEX IF NOT EXISTS idx_interactions_run_round ON interactions(run_id, round_num);
 """
 
 
@@ -308,6 +325,33 @@ async def finalize_run(
                     for aid, (fin, conv, init) in agent_finals.items()
                 ],
             )
+
+
+async def insert_interactions_batch(
+    pool: asyncpg.Pool,
+    run_id: int,
+    rows: list[tuple[int, int, int, str, str, float, float, bool, bool, str, str]],
+) -> None:
+    """Bulk-insert one round's debate pairs.
+
+    Row tuple: (round_num, agent_a_db_id, agent_b_db_id,
+                a_stance, b_stance, a_shift, b_shift,
+                a_convinced, b_convinced, a_argument, b_argument)
+    """
+    if not rows:
+        return
+    payload = [(run_id, *r) for r in rows]
+    sql = """
+        INSERT INTO interactions (
+            run_id, round_num, agent_a_id, agent_b_id,
+            a_stance, b_stance, a_shift, b_shift,
+            a_convinced, b_convinced, a_argument, b_argument
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+    """
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.executemany(sql, payload)
 
 
 async def insert_report(pool: asyncpg.Pool, run_id: int, markdown: str) -> None:

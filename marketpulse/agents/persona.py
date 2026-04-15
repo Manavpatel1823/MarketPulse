@@ -6,25 +6,17 @@ if TYPE_CHECKING:
     from marketpulse.memory.shared import MarketSignals
 
 
-# Panel composition by brand tier (positive, neutral, negative fractions).
-# Picked so aggregate sentiment mirrors how real consumers treat each tier:
-#   incumbent     → most buyers defend status quo
-#   challenger    → curious but cautious
-#   unknown       → default skepticism
-#   controversial → hostile majority
-SKEW_BY_TIER: dict[str, tuple[float, float, float]] = {
-    "incumbent":     (0.50, 0.30, 0.20),
-    "challenger":    (0.35, 0.30, 0.35),
-    "unknown":       (0.20, 0.30, 0.50),
-    "controversial": (0.10, 0.25, 0.65),
-}
-DEFAULT_SKEW = SKEW_BY_TIER["unknown"]
+# Panel composition — fixed ratio regardless of brand tier. Rationale: we
+# evaluate the PRODUCT, not the brand. A startup with a great product should
+# win this panel; an incumbent shipping a dud should lose it. Brand tier still
+# flows into the briefing as context (market footprint), but it doesn't bend
+# the jury. Ratio 4:3:3 (pos:neu:neg) gives a realistic mix — slightly more
+# open-minded than hostile, with a strong skeptic minority.
+DEFAULT_SKEW: tuple[float, float, float] = (0.40, 0.30, 0.30)
 
 
 def _tier_fractions(skew: "MarketSignals | None") -> tuple[float, float, float]:
-    if skew is None:
-        return DEFAULT_SKEW
-    return SKEW_BY_TIER.get(skew.brand_tier, DEFAULT_SKEW)
+    return DEFAULT_SKEW
 
 # Archetype classification (2 positive : 3 neutral : 5 negative)
 # Real markets dominated by incumbents (Apple/Samsung ~81% phone share, etc.) skew

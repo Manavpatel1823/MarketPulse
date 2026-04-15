@@ -52,9 +52,8 @@ class SimulationEngine:
         from marketpulse.agents.persona import ARCHETYPE_TIERS
         tier_of = {a: t for t, archs in ARCHETYPE_TIERS.items() for a in archs}
         tier_counts = Counter(tier_of.get(p.archetype, "?") for p in personas)
-        tier_label = skew.brand_tier if skew else "default"
         console.print(
-            f"[dim]Panel ({tier_label}): "
+            f"[dim]Panel (4:3:3 fixed): "
             f"{tier_counts.get('positive', 0)} pos / "
             f"{tier_counts.get('neutral', 0)} neu / "
             f"{tier_counts.get('negative', 0)} neg[/dim]"
@@ -151,6 +150,7 @@ class SimulationEngine:
             self.previous_pairs.add(tuple(sorted((a.persona.id, b.persona.id))))
 
         conversions = 0
+        interaction_rows: list[tuple] = []
 
         for pair_idx, (a, b) in enumerate(pairs):
             console.print(f"[bold]── Debate {pair_idx + 1}: "
@@ -204,8 +204,29 @@ class SimulationEngine:
                           f"{b.persona.name} {b_old:+.1f}→{b.sentiment:+.1f}[/dim]")
             console.print()
 
+            # Capture the pair for persistence. Round is 1-indexed in the DB so it
+            # aligns with the opinions table (round 0 = initial, 1..N = post-debate).
+            a_db = self._agent_db_ids.get(a.persona.id)
+            b_db = self._agent_db_ids.get(b.persona.id)
+            if a_db is not None and b_db is not None:
+                interaction_rows.append((
+                    round_num + 1, a_db, b_db,
+                    a_result.get("stance", ""), b_result.get("stance", ""),
+                    float(a_result.get("sentiment_shift", 0.0)),
+                    float(b_result.get("sentiment_shift", 0.0)),
+                    bool(a_result.get("convinced", False)),
+                    bool(b_result.get("convinced", False)),
+                    a_result.get("counter_argument", ""),
+                    b_result.get("counter_argument", ""),
+                ))
+
         console.print(f"[yellow]Round {round_num + 1} conversions: {conversions}[/yellow]")
         self._print_sentiment_table(f"After Round {round_num + 1}")
+
+        if self._db_pool and self._run_id and interaction_rows:
+            await storage.insert_interactions_batch(
+                self._db_pool, self._run_id, interaction_rows,
+            )
 
     async def run(self, shared: SharedMemory) -> dict:
         """Run the full simulation."""

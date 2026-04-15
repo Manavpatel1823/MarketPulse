@@ -52,7 +52,8 @@ async def extract(
         f"Raw search snippets:\n{_snippet_block(snippets)}\n\n"
         "Extract and return JSON with EXACTLY these keys:\n"
         "{\n"
-        '  "product": {"description": str, "price": str, "features": [str, ...], "category": str},\n'
+        '  "product": {"description": str, "detailed_description": str, "price": str, '
+        '"features": [str, ...], "category": str, "risks": [str, ...], "target_audience": str},\n'
         '  "competitors": [{"name": str, "price": str, "key_features": [str], "description": str}, ...],\n'
         '  "findings": [{"source": str, "summary": str, "sentiment": "positive"|"neutral"|"negative", "category": str}, ...],\n'
         '  "market_context": str,\n'
@@ -63,6 +64,13 @@ async def extract(
         "  }\n"
         "}\n\n"
         "Guidance:\n"
+        "- description: 1-2 sentence neutral summary.\n"
+        "- detailed_description: 4-6 sentence overview covering value prop, "
+        "differentiation, and use cases — synthesized from the snippets.\n"
+        "- features: 8-15 concrete specs/capabilities, not marketing adjectives.\n"
+        "- risks: 3-6 specific limitations, trade-offs, or concerns surfaced by "
+        "reviews or a skeptic's read. Be product-specific (name the feature/spec).\n"
+        "- target_audience: 1-2 sentences on who this is for.\n"
         "- 2-3 competitors max; real products that consumers would cross-shop.\n"
         "- 5-8 findings covering a mix of sentiments.\n"
         "- market_context: 2-3 sentences on the market this product enters.\n"

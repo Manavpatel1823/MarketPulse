@@ -69,6 +69,116 @@ async def get_run(pool: asyncpg.Pool, run_id: int) -> dict[str, Any] | None:
     return out
 
 
+async def get_run_graph(
+    pool: asyncpg.Pool, run_id: int
+) -> dict[str, Any] | None:
+    """Return a run in node-graph shape for the visualization frontend.
+
+    Shape:
+        {
+          "run_id": int, "product_name": str, "rounds": int,
+          "nodes": [
+            {"id": int, "persona_id": str, "name": str, "archetype": str,
+             "initial_sentiment": float, "final_sentiment": float,
+             "conversion_count": int,
+             "sentiment_by_round": {round_num: sentiment, ...}}
+          ],
+          "edges": [
+            {"id": int, "round_num": int,
+             "source": agent_a_db_id, "target": agent_b_db_id,
+             "a_stance": str, "b_stance": str,
+             "a_shift": float, "b_shift": float,
+             "a_convinced": bool, "b_convinced": bool,
+             "a_argument": str, "b_argument": str}
+          ]
+        }
+
+    Returns None if the run does not exist.
+    """
+    async with pool.acquire() as conn:
+        run = await conn.fetchrow(
+            "SELECT id, product_name, rounds FROM runs WHERE id = $1", run_id,
+        )
+        if not run:
+            return None
+        agents = await conn.fetch(
+            """
+            SELECT id, persona_id, name, archetype, age, income_bracket,
+                   initial_bias, initial_sentiment, final_sentiment,
+                   conversion_count
+              FROM agents
+             WHERE run_id = $1
+            """,
+            run_id,
+        )
+        # Per-round sentiment timeline straight from opinions.
+        opinions = await conn.fetch(
+            """
+            SELECT agent_id, round_num, sentiment
+              FROM opinions
+             WHERE run_id = $1
+             ORDER BY agent_id, round_num
+            """,
+            run_id,
+        )
+        interactions = await conn.fetch(
+            """
+            SELECT id, round_num, agent_a_id, agent_b_id,
+                   a_stance, b_stance, a_shift, b_shift,
+                   a_convinced, b_convinced, a_argument, b_argument
+              FROM interactions
+             WHERE run_id = $1
+             ORDER BY round_num, id
+            """,
+            run_id,
+        )
+
+    by_agent: dict[int, dict[int, float]] = {}
+    for o in opinions:
+        by_agent.setdefault(o["agent_id"], {})[o["round_num"]] = o["sentiment"]
+
+    nodes = []
+    for a in agents:
+        nodes.append({
+            "id": a["id"],
+            "persona_id": a["persona_id"],
+            "name": a["name"],
+            "archetype": a["archetype"],
+            "age": a["age"],
+            "income_bracket": a["income_bracket"],
+            "initial_bias": a["initial_bias"],
+            "initial_sentiment": a["initial_sentiment"],
+            "final_sentiment": a["final_sentiment"],
+            "conversion_count": a["conversion_count"] or 0,
+            "sentiment_by_round": by_agent.get(a["id"], {}),
+        })
+
+    edges = []
+    for e in interactions:
+        edges.append({
+            "id": e["id"],
+            "round_num": e["round_num"],
+            "source": e["agent_a_id"],
+            "target": e["agent_b_id"],
+            "a_stance": e["a_stance"],
+            "b_stance": e["b_stance"],
+            "a_shift": e["a_shift"],
+            "b_shift": e["b_shift"],
+            "a_convinced": e["a_convinced"],
+            "b_convinced": e["b_convinced"],
+            "a_argument": e["a_argument"],
+            "b_argument": e["b_argument"],
+        })
+
+    return {
+        "run_id": run["id"],
+        "product_name": run["product_name"],
+        "rounds": run["rounds"],
+        "nodes": nodes,
+        "edges": edges,
+    }
+
+
 async def compare_runs(
     pool: asyncpg.Pool, run_ids: list[int]
 ) -> list[dict[str, Any]]:

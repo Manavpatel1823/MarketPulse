@@ -81,6 +81,25 @@ models/
 ehthumbs.db
 Thumbs.db
 
+# ===== Frontend (React + Vite) =====
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/.cache/
+frontend/*.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+package-lock.json.bak
+
+# ===== Claude Code / agent tooling =====
+.claude/
+.plans/
+CLAUDE.local.md
+
 # ===== Misc =====
 test.py
 *.bak
