@@ -120,6 +120,9 @@ async def main():
                     help="Show full detail for one run from the database and exit.")
     ap.add_argument("--compare", type=int, nargs="+", metavar="RUN_ID",
                     help="Compare 2+ runs side-by-side and exit.")
+    ap.add_argument("--resume", type=int, metavar="RUN_ID",
+                    help="Resume a crashed run from its last persisted round. "
+                         "Rebuilds agents + shared memory from DB.")
     ap.add_argument("--serve", action="store_true",
                     help="Start the visualization API on localhost:8000 and exit.")
     ap.add_argument("--port", type=int, default=8000,
@@ -168,6 +171,16 @@ async def main():
             log_level="info",
         )
         await uvicorn.Server(config).serve()
+        return
+
+    # ── Resume mode: rebuild a crashed run from DB and finish it ──────
+    if args.resume is not None:
+        llm = build_llm(settings)
+        engine = SimulationEngine(settings=settings, llm=llm)
+        try:
+            await engine.resume(args.resume)
+        finally:
+            await storage.close_pool()
         return
 
     # ── DB inspection mode (no sim, no LLM) ────────────────────────────

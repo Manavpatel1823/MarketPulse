@@ -10,15 +10,24 @@ from rich.text import Text
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
 
 from marketpulse.agents.agent import Agent
-from marketpulse.agents.persona import generate_personas, enrich_personas
+from marketpulse.agents.persona import Persona, generate_personas
+from marketpulse.agents.hardcoded_personas import HARDCODED_PERSONAS
 from marketpulse.agents.pool import AgentPool
 from marketpulse.config import Settings
 from marketpulse.llm.base import LLMBackend
-from marketpulse.memory.shared import SharedMemory
+from marketpulse.memory.individual import ConversionEvent, Opinion
+from marketpulse.memory.shared import (
+    CompetitorInfo,
+    MarketSignals,
+    ProductInfo,
+    ResearchFinding,
+    SharedMemory,
+)
 from marketpulse.reporting.analyzer import generate_report
 from marketpulse.simulation.interaction import adversarial_pairing
 from marketpulse.simulation.sentiment import apply_persuasion
 from marketpulse.storage import db as storage
+from marketpulse.storage import queries as db_queries
 
 # record=True lets us export everything printed as plain text / HTML at end of run.
 # Zero runtime cost, zero LLM token cost.
@@ -58,14 +67,6 @@ class SimulationEngine:
             f"{tier_counts.get('neutral', 0)} neu / "
             f"{tier_counts.get('negative', 0)} neg[/dim]"
         )
-
-        with Progress(
-            SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
-            console=console,
-        ) as progress:
-            task = progress.add_task("Enriching personas with LLM...", total=None)
-            personas = await enrich_personas(personas, self.llm)
-            progress.update(task, completed=True)
 
         self.agents = [Agent(p) for p in personas]
 
@@ -146,16 +147,17 @@ class SimulationEngine:
         console.print(f"[dim]{len(pairs)} pairs debating...[/dim]\n")
 
         # Track pairs
-        for a, b in pairs:
+        for a, b, _ in pairs:
             self.previous_pairs.add(tuple(sorted((a.persona.id, b.persona.id))))
 
         conversions = 0
         interaction_rows: list[tuple] = []
 
-        for pair_idx, (a, b) in enumerate(pairs):
+        for pair_idx, (a, b, shared_topics) in enumerate(pairs):
+            topic_suffix = f" [dim]— shared: {', '.join(shared_topics)}[/dim]" if shared_topics else ""
             console.print(f"[bold]── Debate {pair_idx + 1}: "
                           f"{a.persona.name} ({a.persona.archetype}) vs "
-                          f"{b.persona.name} ({b.persona.archetype}) ──[/bold]")
+                          f"{b.persona.name} ({b.persona.archetype}){topic_suffix} ──[/bold]")
 
             # Get their current positions
             a_opinion = a.memory.latest_opinion
@@ -169,9 +171,15 @@ class SimulationEngine:
             console.print(f"\n  [magenta]{b.persona.name}[/magenta] (sentiment {b.sentiment:+.1f}):")
             console.print(f"  [italic]\"{b_argument}\"[/italic]")
 
-            # Both debate each other's arguments
-            a_result = await a.debate(b.persona.id, b_argument, shared, self.llm, round_num)
-            b_result = await b.debate(a.persona.id, a_argument, shared, self.llm, round_num)
+            # Both debate each other's arguments. Isolate per-pair failure
+            # so one rate-limit-exhausted call doesn't kill the whole run —
+            # we skip the pair and continue, preserving prior tokens spent.
+            try:
+                a_result = await a.debate(b.persona.id, b_argument, shared, self.llm, round_num, shared_topics)
+                b_result = await b.debate(a.persona.id, a_argument, shared, self.llm, round_num, shared_topics)
+            except Exception as e:
+                console.print(f"  [red][debate-failed] skipping pair — {type(e).__name__}: {e}[/red]")
+                continue
 
             # Show responses
             console.print(f"\n  [cyan]{a.persona.name}[/cyan] responds ({a_result['stance']}):")
@@ -228,6 +236,28 @@ class SimulationEngine:
                 self._db_pool, self._run_id, interaction_rows,
             )
 
+    async def reflection_phase(self, shared: SharedMemory, round_num: int) -> None:
+        """Every agent refines their opinion using this round's debate memory."""
+        console.print(
+            f"\n[bold cyan]─── REFLECTION (round {round_num + 1}) ───[/bold cyan]"
+        )
+        tasks = [
+            lambda a=agent: a.refine_opinion(shared, self.llm, round_num)
+            for agent in self.agents
+        ]
+        with Progress(
+            SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+            BarColumn(), TextColumn("{task.completed}/{task.total}"),
+            console=console,
+        ) as progress:
+            ptask = progress.add_task("Refining opinions", total=len(tasks))
+            done = 0
+            for i in range(0, len(tasks), self.settings.batch_size):
+                batch = tasks[i : i + self.settings.batch_size]
+                await self.pool.execute_batch(batch)
+                done += len(batch)
+                progress.update(ptask, completed=done)
+
     async def run(self, shared: SharedMemory) -> dict:
         """Run the full simulation."""
         console.print("[bold magenta]╔══════════════════════════════════════╗[/bold magenta]")
@@ -281,9 +311,10 @@ class SimulationEngine:
             await self.opinion_phase(shared)
             await self._persist_round_opinions(round_num=0)
 
-            # Phase 3: Debate rounds
+            # Phase 3: Debate rounds + reflection
             for round_num in range(self.settings.rounds):
                 await self.debate_round(shared, round_num)
+                await self.reflection_phase(shared, round_num)
                 await self._persist_round_opinions(round_num=round_num + 1)
 
             # Collect results
@@ -317,6 +348,234 @@ class SimulationEngine:
             # Connection pool stays alive for the process; nothing to close
             # per-run. close_pool() is the program-exit hook.
             pass
+
+    async def resume(self, run_id: int) -> dict:
+        """Resume a crashed run from its last persisted round.
+
+        Reconstructs SharedMemory and Agent objects (with latest opinion,
+        sentiment history, and conversion count) from the DB, then re-enters
+        the main loop at the right round.
+        """
+        if not self.settings.persist_db:
+            raise SystemExit("--resume requires PERSIST_DB=true; cannot rebuild state without a DB.")
+
+        self._db_pool = await storage.get_pool(self.settings.database_url)
+        state = await db_queries.get_resume_state(self._db_pool, run_id)
+        if not state:
+            raise SystemExit(f"No run with id={run_id}")
+        if state["run"]["finished_at"] is not None:
+            raise SystemExit(
+                f"Run {run_id} already finished at {state['run']['finished_at']}. "
+                f"Nothing to resume."
+            )
+
+        self._run_id = run_id
+        run_row = state["run"]
+        console.print(f"\n[bold cyan]═══ RESUMING RUN #{run_id} ═══[/bold cyan]")
+        console.print(
+            f"Product: [bold]{run_row['product_name']}[/bold]  "
+            f"Agents: {run_row['agent_count']}  Rounds: {run_row['rounds']}  "
+            f"Backend: {run_row['backend']} ({run_row['model']})"
+        )
+        if run_row["backend"] != self.settings.backend:
+            console.print(
+                f"[yellow]Warning: original backend was '{run_row['backend']}', "
+                f"current env uses '{self.settings.backend}'. "
+                f"Resume will use the current backend.[/yellow]"
+            )
+
+        shared = self._rebuild_shared_memory(state["shared_memory"])
+        self.agents, self._agent_db_ids = self._rebuild_agents(state["agents"])
+
+        last_round = state["last_round"]
+        total_rounds = run_row["rounds"]
+        console.print(
+            f"[dim]Last completed round in DB: "
+            f"{'none' if last_round is None else last_round}/{total_rounds}[/dim]"
+        )
+
+        # Clean up any partially-written rows beyond last_round so we don't
+        # double-insert when we re-run that round (defensive — today we
+        # persist one round atomically, but this protects against future
+        # partial-write paths).
+        if last_round is not None:
+            await db_queries.delete_future_opinions(self._db_pool, run_id, last_round)
+
+        try:
+            if last_round is None:
+                # Opinion phase never completed — start from round 0
+                await self.opinion_phase(shared)
+                await self._persist_round_opinions(round_num=0)
+                start_round = 0
+            else:
+                # Populate self.previous_pairs from prior interactions so new
+                # pairings still honor the "don't repeat" preference.
+                await self._seed_previous_pairs(run_id)
+                start_round = last_round
+
+            if start_round < total_rounds:
+                for round_num in range(start_round, total_rounds):
+                    await self.debate_round(shared, round_num)
+                    await self.reflection_phase(shared, round_num)
+                    await self._persist_round_opinions(round_num=round_num + 1)
+            else:
+                console.print("[dim]All rounds already complete; skipping to report.[/dim]")
+
+            results = self._collect_results(shared)
+            self._print_final_summary(results)
+
+            console.print("\n[bold cyan]═══ GENERATING MARKETING REPORT ═══[/bold cyan]")
+            with Progress(
+                SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                console=console,
+            ) as progress:
+                ptask = progress.add_task("Reasoning agent analyzing all data...", total=None)
+                report = await generate_report(results, shared, self.llm)
+                progress.update(ptask, completed=True)
+
+            console.print(report)
+            results["report"] = report
+
+            folder_name = run_row["folder_name"] + "_resumed"
+            self._save_run_outputs(shared, results, report, folder_name)
+            await self._finalize_db(results)
+            return results
+        finally:
+            pass
+
+    def _rebuild_shared_memory(self, sm: dict | None) -> SharedMemory:
+        if not sm or not sm.get("product"):
+            raise SystemExit("Cannot resume — shared_memory row is missing or corrupt.")
+        p = sm["product"]
+        product = ProductInfo(
+            name=p.get("name", ""),
+            description=p.get("description", ""),
+            price=p.get("price", ""),
+            features=p.get("features", []) or [],
+            category=p.get("category", ""),
+        )
+        competitors = [
+            CompetitorInfo(
+                name=c.get("name", ""),
+                description=c.get("description", ""),
+                price=c.get("price", ""),
+                key_features=c.get("key_features", []) or [],
+            )
+            for c in sm.get("competitors") or []
+        ]
+        findings = [
+            ResearchFinding(
+                source=f.get("source", ""),
+                summary=f.get("summary", ""),
+                sentiment=f.get("sentiment", "neutral"),
+                category=f.get("category", ""),
+            )
+            for f in sm.get("findings") or []
+        ]
+        signals = None
+        s = sm.get("signals")
+        if s:
+            signals = MarketSignals(
+                brand_tier=s.get("brand_tier", "unknown"),
+                category_maturity=s.get("category_maturity", "established"),
+                price_position=s.get("price_position", "parity"),
+            )
+        return SharedMemory(
+            product=product,
+            competitors=competitors,
+            research_findings=findings,
+            market_context=sm.get("market_context") or "",
+            signals=signals,
+        )
+
+    def _rebuild_agents(self, agent_blocks: list[dict]) -> tuple[list[Agent], dict[str, int]]:
+        """Reconstruct Agent objects from DB rows.
+
+        Looks up the full Persona from HARDCODED_PERSONAS by persona_id
+        (tech_savviness / brand_loyalty / price_sensitivity / personality_blurb
+        aren't persisted — hardcoded pool is the source of truth). Agents
+        whose persona_id isn't in the pool (procedural padding) are synthesized
+        from stored fields + archetype-default traits; they won't be identical
+        to the original procedural persona but the trait distribution is
+        preserved.
+        """
+        by_id = {p.id: p for p in HARDCODED_PERSONAS}
+        agents: list[Agent] = []
+        db_ids: dict[str, int] = {}
+
+        for blk in agent_blocks:
+            pid = blk["persona_id"]
+            persona = by_id.get(pid)
+            if persona is None:
+                persona = self._synthesize_persona_from_row(blk)
+            agent = Agent(persona)
+            db_ids[persona.id] = blk["agent_db_id"]
+
+            latest = blk.get("latest_opinion")
+            if latest is not None:
+                op = Opinion(
+                    sentiment=latest["sentiment"],
+                    concerns=latest["concerns"],
+                    positives=latest["positives"],
+                    reasoning=latest["reasoning"] or "",
+                )
+                agent.memory.opinions.append(op)
+                agent.sentiment = op.sentiment
+            agent.memory.sentiment_history = list(blk.get("sentiment_history") or [])
+            # Conversion events are only counted (len) downstream; minimal stubs are fine.
+            n_conv = blk.get("conversion_count") or 0
+            agent.memory.conversion_events = [
+                ConversionEvent(round_num=0, triggered_by="resumed",
+                                old_sentiment=agent.sentiment,
+                                new_sentiment=agent.sentiment, reason="")
+                for _ in range(n_conv)
+            ]
+            agents.append(agent)
+
+        return agents, db_ids
+
+    @staticmethod
+    def _synthesize_persona_from_row(blk: dict) -> Persona:
+        """Fallback for procedural personas not present in the hardcoded pool.
+
+        Uses the midpoint of the archetype trait ranges — not pixel-perfect,
+        but close enough to keep the simulation coherent when resuming.
+        """
+        from marketpulse.agents.persona import ARCHETYPES
+        arch = blk["archetype"]
+        ranges = ARCHETYPES.get(arch, ARCHETYPES["pragmatist"])
+        mid = lambda lo_hi: round((lo_hi[0] + lo_hi[1]) / 2, 2)
+        return Persona(
+            id=blk["persona_id"],
+            name=blk["name"],
+            age=blk["age"] or 35,
+            income_bracket=blk["income_bracket"] or "middle",
+            tech_savviness=mid(ranges["tech_savviness"]),
+            brand_loyalty=mid(ranges["brand_loyalty"]),
+            price_sensitivity=mid(ranges["price_sensitivity"]),
+            archetype=arch,
+            personality_blurb=f"A {arch.replace('_', ' ')} consumer (resumed from DB).",
+            initial_bias=blk["initial_bias"] or 0.0,
+        )
+
+    async def _seed_previous_pairs(self, run_id: int) -> None:
+        """Rebuild previous_pairs set from persisted interactions so post-resume
+        pairing still avoids repeats from the pre-crash rounds."""
+        if not self._db_pool:
+            return
+        async with self._db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT a.persona_id AS a_pid, b.persona_id AS b_pid
+                  FROM interactions i
+                  JOIN agents a ON a.id = i.agent_a_id
+                  JOIN agents b ON b.id = i.agent_b_id
+                 WHERE i.run_id = $1
+                """,
+                run_id,
+            )
+        for r in rows:
+            self.previous_pairs.add(tuple(sorted((r["a_pid"], r["b_pid"]))))
 
     async def _persist_round_opinions(self, round_num: int) -> None:
         if not (self._db_pool and self._run_id):

@@ -179,6 +179,149 @@ async def get_run_graph(
     }
 
 
+async def get_resume_state(
+    pool: asyncpg.Pool, run_id: int
+) -> dict[str, Any] | None:
+    """Pull everything needed to resume a crashed run.
+
+    Shape:
+        {
+          "run": {id, product_name, folder_name, agent_count, rounds,
+                  backend, model, settings_json, finished_at},
+          "shared_memory": {product, competitors, findings, market_context, signals},
+          "agents": [
+            {agent_db_id, persona_id, name, archetype, age, income_bracket,
+             initial_bias, sentiment_history: [..], latest_opinion: {...} | None,
+             conversion_count: int}
+          ],
+          "last_round": int | None  # max round_num in opinions, None if empty
+        }
+    """
+    async with pool.acquire() as conn:
+        run = await conn.fetchrow(
+            """
+            SELECT id, product_name, folder_name, agent_count, rounds,
+                   backend, model, settings_json, finished_at
+              FROM runs WHERE id = $1
+            """,
+            run_id,
+        )
+        if not run:
+            return None
+        sm = await conn.fetchrow(
+            "SELECT * FROM shared_memory WHERE run_id = $1", run_id
+        )
+        agents = await conn.fetch(
+            """
+            SELECT id, persona_id, name, archetype, age, income_bracket,
+                   initial_bias
+              FROM agents
+             WHERE run_id = $1
+             ORDER BY id
+            """,
+            run_id,
+        )
+        opinions = await conn.fetch(
+            """
+            SELECT agent_id, round_num, sentiment, reasoning,
+                   concerns_json, positives_json
+              FROM opinions
+             WHERE run_id = $1
+             ORDER BY agent_id, round_num
+            """,
+            run_id,
+        )
+        conv_rows = await conn.fetch(
+            """
+            SELECT agent_a_id, a_convinced, agent_b_id, b_convinced
+              FROM interactions
+             WHERE run_id = $1
+            """,
+            run_id,
+        )
+        max_round = await conn.fetchval(
+            "SELECT MAX(round_num) FROM opinions WHERE run_id = $1", run_id,
+        )
+
+    # Aggregate opinions and conversions per agent.
+    by_agent_ops: dict[int, list[dict]] = {}
+    for o in opinions:
+        by_agent_ops.setdefault(o["agent_id"], []).append({
+            "round_num": o["round_num"],
+            "sentiment": o["sentiment"],
+            "reasoning": o["reasoning"],
+            "concerns": json.loads(o["concerns_json"] or "[]"),
+            "positives": json.loads(o["positives_json"] or "[]"),
+        })
+
+    conv_counts: dict[int, int] = {}
+    for r in conv_rows:
+        if r["a_convinced"]:
+            conv_counts[r["agent_a_id"]] = conv_counts.get(r["agent_a_id"], 0) + 1
+        if r["b_convinced"]:
+            conv_counts[r["agent_b_id"]] = conv_counts.get(r["agent_b_id"], 0) + 1
+
+    agent_blocks = []
+    for a in agents:
+        aid = a["id"]
+        ops = by_agent_ops.get(aid, [])
+        # sentiment_history comes straight out of the opinions table in round order
+        hist = [o["sentiment"] for o in ops]
+        latest = ops[-1] if ops else None
+        agent_blocks.append({
+            "agent_db_id": aid,
+            "persona_id": a["persona_id"],
+            "name": a["name"],
+            "archetype": a["archetype"],
+            "age": a["age"],
+            "income_bracket": a["income_bracket"],
+            "initial_bias": a["initial_bias"],
+            "sentiment_history": hist,
+            "latest_opinion": latest,
+            "conversion_count": conv_counts.get(aid, 0),
+        })
+
+    sm_block = None
+    if sm:
+        sm_dict = _decode(dict(sm), "product_json", "competitors_json",
+                          "findings_json", "signals_json")
+        sm_block = {
+            "product": sm_dict.get("product_json"),
+            "competitors": sm_dict.get("competitors_json") or [],
+            "findings": sm_dict.get("findings_json") or [],
+            "market_context": sm_dict.get("market_context"),
+            "signals": sm_dict.get("signals_json"),
+        }
+
+    run_dict = _decode(dict(run), "settings_json")
+    return {
+        "run": run_dict,
+        "shared_memory": sm_block,
+        "agents": agent_blocks,
+        "last_round": max_round,  # None if no opinions yet
+    }
+
+
+async def delete_future_opinions(
+    pool: asyncpg.Pool, run_id: int, keep_through_round: int
+) -> None:
+    """Trim any opinions/interactions beyond keep_through_round.
+
+    Defensive: if a prior crash left orphan rows from a partially-written round,
+    drop them before resuming so we don't double-write or break uniqueness.
+    """
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "DELETE FROM opinions WHERE run_id = $1 AND round_num > $2",
+                run_id, keep_through_round,
+            )
+            await conn.execute(
+                "DELETE FROM interactions WHERE run_id = $1 AND round_num > $2",
+                run_id, keep_through_round,
+            )
+
+
 async def compare_runs(
     pool: asyncpg.Pool, run_ids: list[int]
 ) -> list[dict[str, Any]]:

@@ -6,8 +6,9 @@ from openai import AsyncOpenAI, RateLimitError, APIError
 
 from .base import LLMBackend
 
-MAX_RETRIES = 5
-BASE_BACKOFF_SECONDS = 2.0  # exponential: 2s, 4s, 8s, 16s, 32s
+MAX_RETRIES = 10
+BASE_BACKOFF_SECONDS = 2.0
+MAX_BACKOFF_SECONDS = 60.0  # cap exponential growth; a 60s window covers most upstream rate-limit periods
 
 
 class OpenRouterBackend(LLMBackend):
@@ -38,7 +39,17 @@ class OpenRouterBackend(LLMBackend):
                 return await self.client.chat.completions.create(**kwargs)
             except RateLimitError as e:
                 last_exc = e
-                delay = BASE_BACKOFF_SECONDS * (2 ** attempt) + random.uniform(0, 1)
+                # Prefer server-provided Retry-After when available; fall back
+                # to capped exponential so a burst doesn't fail after ~60s.
+                retry_after = None
+                try:
+                    ra = getattr(e, "response", None)
+                    if ra is not None:
+                        retry_after = float(ra.headers.get("retry-after") or 0)
+                except Exception:
+                    retry_after = None
+                exp = BASE_BACKOFF_SECONDS * (2 ** attempt) + random.uniform(0, 1)
+                delay = min(MAX_BACKOFF_SECONDS, max(retry_after or 0, exp))
                 print(f"  [rate-limited] retry {attempt + 1}/{MAX_RETRIES} in {delay:.1f}s")
                 await asyncio.sleep(delay)
             except APIError as e:

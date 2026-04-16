@@ -104,12 +104,28 @@ def _product_context_block(shared: SharedMemory) -> str:
         f"Price: {p.price or '(unspecified)'}",
         f"Description: {p.description or '(none)'}",
     ]
+    if p.detailed_description:
+        lines.append(f"Detail: {p.detailed_description}")
     if p.features:
         lines.append(f"Features: {', '.join(p.features[:8])}")
+    if p.risks:
+        lines.append(
+            "Known weaknesses (USE THESE for the risks section — "
+            "they are the brief's honest trade-offs):"
+        )
+        for r in p.risks[:6]:
+            lines.append(f"  - {r}")
+    if p.target_audience:
+        lines.append(f"Target audience: {p.target_audience}")
     if shared.competitors:
-        lines.append("Competitors (USE THESE NAMES IN THE REPORT):")
+        lines.append(
+            "Competitors (USE THESE NAMES IN THE REPORT; the Positioning line "
+            "is authoritative on strengths/weaknesses — do NOT contradict it):"
+        )
         for c in shared.competitors:
             lines.append(f"  - {c.name} ({c.price}): {', '.join(c.key_features[:4])}")
+            if c.positioning:
+                lines.append(f"    Positioning: {c.positioning}")
     if shared.signals:
         s = shared.signals
         lines.append(
@@ -166,7 +182,7 @@ async def generate_report(results: dict, shared: SharedMemory, llm: LLMBackend) 
     system = (
         "You are a senior marketing strategist with 20 years of experience. "
         "You analyze consumer simulation data to produce ACTIONABLE intelligence. "
-        "Three rules you NEVER break:\n"
+        "Four rules you NEVER break:\n"
         "1. Lead every analysis with the SHAPE of the distribution, not the mean. "
         "A 6/10 mean from broad mild approval and a 6/10 mean from a polarized "
         "love/hate split require completely different marketing strategies. "
@@ -182,7 +198,14 @@ async def generate_report(results: dict, shared: SharedMemory, llm: LLMBackend) 
         "echo that gate in the Executive Summary verbatim in intent — do NOT "
         "recommend launch when the gate says HOLD, DO NOT, or CAUTION. A few "
         "enthusiastic agents do not override widespread concerns or polarization. "
-        "Downside must be surfaced even when the mean is positive."
+        "Downside must be surfaced even when the mean is positive.\n"
+        "4. NO FABRICATED NUMBERS. Every specific number (price, weight, battery "
+        "hours, nits, resolution, framerate) must come from the PRODUCT CONTEXT "
+        "block. Do NOT invent plausible-sounding specs for competitors. If the "
+        "context doesn't give you a number to compare against, say 'better battery "
+        "than ROG Ally X' — do NOT say 'vs. ROG Ally X's 4-6 hours' unless that "
+        "figure is literally in the context. Fabricated specs ship as fact into "
+        "a marketing deck; this is the worst failure mode."
     )
 
     user = (
@@ -220,8 +243,15 @@ async def generate_report(results: dict, shared: SharedMemory, llm: LLMBackend) 
         f"   - Same rule. Name the segment, the feature, the competitor "
         f"this product wins against.\n\n"
         f"5. COMPETITIVE POSITIONING\n"
-        f"   - Name each competitor from the product context. State explicitly "
-        f"where this product wins / loses vs each.\n\n"
+        f"   - Name each competitor from the product context. For each one, "
+        f"frame from THIS PRODUCT's perspective:\n"
+        f"     • 'Steam Deck OLED wins vs X on: ...' (concrete advantages)\n"
+        f"     • 'Steam Deck OLED loses vs X on: ...' (concrete gaps)\n"
+        f"   - Never phrase a competitor's advantage as the competitor 'losing' "
+        f"something — that reads as nonsense (e.g. 'Switch loses PC game library' "
+        f"is wrong; it should be 'this product wins vs Switch on: PC game library').\n"
+        f"   - Use only specs that appear in the PRODUCT CONTEXT. If you don't "
+        f"have a comparable number, make the point qualitatively.\n\n"
         f"6. CONVERSION ANALYSIS\n"
         f"   - What types of arguments moved the needle? "
         f"What does this say about messaging?\n\n"

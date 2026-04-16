@@ -211,7 +211,13 @@ def _generate_procedural(
             brand_loyalty=round(random.uniform(*ranges["brand_loyalty"]), 2),
             price_sensitivity=round(random.uniform(*ranges["price_sensitivity"]), 2),
             archetype=archetype,
-            personality_blurb="",  # filled by LLM enrichment
+            personality_blurb=(
+                f"A {archetype.replace('_', ' ')} consumer in their "
+                f"{'20s' if age_lo < 30 else '30s' if age_lo < 40 else '40s' if age_lo < 50 else '50s+'} "
+                f"with {random.choice(INCOME_BRACKETS).replace('_', ' ')} income. "
+                f"Approaches purchases through a "
+                f"{'price-first' if random.random() < 0.5 else 'features-first'} lens."
+            ),
             initial_bias=round(random.uniform(*ranges["initial_bias"]), 2),
         )
         personas.append(persona)
@@ -219,44 +225,3 @@ def _generate_procedural(
     return personas
 
 
-async def enrich_personas(personas: list[Persona], llm) -> list[Persona]:
-    """Enrich personas with LLM-generated personality blurbs in batches.
-
-    Skips any persona that already has a non-empty blurb (e.g. hardcoded ones).
-    """
-    # Only enrich personas without a blurb — hardcoded personas come pre-filled.
-    needs_enrichment = [p for p in personas if not p.personality_blurb]
-    if not needs_enrichment:
-        return personas
-
-    batch_size = 10
-    for i in range(0, len(needs_enrichment), batch_size):
-        batch = needs_enrichment[i : i + batch_size]
-        descriptions = []
-        for p in batch:
-            descriptions.append(
-                f"- {p.name}, age {p.age}, {p.income_bracket} income, "
-                f"{p.archetype} type, tech-savvy={p.tech_savviness:.1f}, "
-                f"price-sensitive={p.price_sensitivity:.1f}"
-            )
-
-        system = (
-            "You generate brief consumer personality descriptions. "
-            "For each person listed, write a 2-sentence personality blurb "
-            "that captures how they approach purchasing decisions. "
-            "Return JSON: {\"blurbs\": [\"blurb1\", \"blurb2\", ...]}"
-        )
-        user = "Generate personality blurbs for:\n" + "\n".join(descriptions)
-
-        result = await llm.generate_json(system, user)
-        blurbs = result.get("blurbs", [])
-        for j, persona in enumerate(batch):
-            if j < len(blurbs):
-                persona.personality_blurb = blurbs[j]
-            else:
-                persona.personality_blurb = (
-                    f"A {persona.archetype} consumer who values "
-                    f"{'affordability' if persona.price_sensitivity > 0.6 else 'quality'}."
-                )
-
-    return personas

@@ -1,3 +1,4 @@
+import random
 from dataclasses import dataclass, field
 
 
@@ -50,48 +51,47 @@ class SharedMemory:
     market_context: str = ""
     signals: MarketSignals | None = None
 
-    def get_agent_briefing(self) -> str:
+    def get_agent_briefing(self, agent_id: str | None = None) -> str:
+        """Render the briefing. If agent_id is given, the feature list and
+        research findings are shuffled with a per-agent deterministic seed
+        so primacy bias doesn't push every agent toward the same first
+        feature. The shuffle is stable across rounds for one agent (their
+        worldview is consistent) but varies across agents in the panel.
+        """
+        if agent_id is not None:
+            rng = random.Random(agent_id)
+            features = list(self.product.features)
+            rng.shuffle(features)
+            findings = list(self.research_findings)
+            rng.shuffle(findings)
+        else:
+            features = self.product.features
+            findings = self.research_findings
+
         lines = [
-            f"Product: {self.product.name} — {self.product.description}",
+            f"Product: {self.product.name} - {self.product.description}",
+            f"Price: {self.product.price}",
+            f"Features: {', '.join(features)}",
         ]
-        if self.product.detailed_description:
-            lines.append(f"Overview: {self.product.detailed_description}")
-        lines.append(f"Price: {self.product.price}")
-        lines.append(f"Features: {', '.join(self.product.features)}")
-        if self.product.target_audience:
-            lines.append(f"Target audience: {self.product.target_audience}")
+        # Risks were being silently discarded from agent briefings; this meant
+        # agents had to re-derive weaknesses from findings alone. Surface them
+        # directly so skeptics get to name real trade-offs, not generic ones.
         if self.product.risks:
-            lines.append("Known risks / limitations:")
-            for r in self.product.risks:
-                lines.append(f"- {r}")
+            risks = list(self.product.risks)
+            if agent_id is not None:
+                rng = random.Random(f"risks-{agent_id}")
+                rng.shuffle(risks)
+            lines.append(f"Known weaknesses / trade-offs: {'; '.join(risks)}")
         if self.competitors:
             lines.append("\nCompetitors:")
             for c in self.competitors:
                 lines.append(f"- {c.name} ({c.price}): {', '.join(c.key_features)}")
                 if c.positioning:
-                    lines.append(f"  positioning: {c.positioning}")
-        if self.research_findings:
+                    lines.append(f"  Positioning: {c.positioning}")
+        if findings:
             lines.append("\nKey Research Findings:")
-            for f in self.research_findings[:10]:
+            for f in findings[:10]:
                 lines.append(f"- [{f.sentiment}] {f.summary}")
         if self.market_context:
             lines.append(f"\nMarket Context: {self.market_context}")
-        if self.signals:
-            tier_notes = {
-                "incumbent":
-                    "Brand footprint: established market leader with wide distribution "
-                    "and proven support. Factor this into risk, not into product quality.",
-                "challenger":
-                    "Brand footprint: rising competitor with some traction but not yet "
-                    "dominant — may need to out-market incumbents to win shelf space.",
-                "unknown":
-                    "Brand footprint: early-stage / low recognition — discovery and trust "
-                    "will need heavy marketing investment, regardless of product merit.",
-                "controversial":
-                    "Brand footprint: carries baggage (past incidents, quality complaints, "
-                    "or PR issues). Consumers may discount claims even on a strong product.",
-            }
-            note = tier_notes.get(self.signals.brand_tier)
-            if note:
-                lines.append(f"\n{note}")
         return "\n".join(lines)
