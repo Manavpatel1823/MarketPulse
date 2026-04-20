@@ -1,6 +1,16 @@
-import { useMemo } from "react";
+import { useCallback, useMemo } from "react";
 import { useStore } from "../store";
 import type { LiveEdge, LiveNode } from "../store";
+
+function downloadMarkdown(text: string, filename: string) {
+  const blob = new Blob([text], { type: "text/markdown" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
 
 const ARCHETYPE_COLORS: Record<string, string> = {
   early_adopter: "#22d3ee",
@@ -124,6 +134,12 @@ export function LiveSimulation() {
   }, [nodes]);
 
   const opinionsFormed = nodes.filter((n) => n.sentiment !== null).length;
+
+  const handleDownload = useCallback(() => {
+    if (!liveReport || !productName) return;
+    const name = productName.replace(/[^a-zA-Z0-9]+/g, "-").toLowerCase();
+    downloadMarkdown(liveReport, `${name}-report.md`);
+  }, [liveReport, productName]);
 
   return (
     <div style={{ height: "100%", display: "flex", flexDirection: "column" }}>
@@ -360,20 +376,37 @@ export function LiveSimulation() {
         >
           <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 16 }}>
             <h2 style={{ margin: 0, fontSize: 18 }}>Marketing Report</h2>
-            <button
-              onClick={resetLive}
-              style={{
-                background: "#333",
-                border: "none",
-                borderRadius: 6,
-                padding: "6px 14px",
-                color: "#eee",
-                cursor: "pointer",
-                fontSize: 12,
-              }}
-            >
-              New Simulation
-            </button>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button
+                onClick={handleDownload}
+                style={{
+                  background: "#2563eb",
+                  border: "none",
+                  borderRadius: 6,
+                  padding: "6px 14px",
+                  color: "#fff",
+                  cursor: "pointer",
+                  fontSize: 12,
+                  fontWeight: 600,
+                }}
+              >
+                Download .md
+              </button>
+              <button
+                onClick={resetLive}
+                style={{
+                  background: "#333",
+                  border: "none",
+                  borderRadius: 6,
+                  padding: "6px 14px",
+                  color: "#eee",
+                  cursor: "pointer",
+                  fontSize: 12,
+                }}
+              >
+                New Simulation
+              </button>
+            </div>
           </div>
           <pre
             style={{

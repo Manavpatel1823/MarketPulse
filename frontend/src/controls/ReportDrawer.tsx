@@ -1,10 +1,27 @@
+import { useCallback } from "react";
 import ReactMarkdown from "react-markdown";
 import { useStore } from "../store";
+
+function downloadMarkdown(text: string, filename: string) {
+  const blob = new Blob([text], { type: "text/markdown" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
 
 export function ReportDrawer() {
   const detail = useStore((s) => s.detail);
   const open = useStore((s) => s.reportOpen);
   const setOpen = useStore((s) => s.setReportOpen);
+
+  const handleDownload = useCallback(() => {
+    if (!detail?.report) return;
+    const name = detail.product_name.replace(/[^a-zA-Z0-9]+/g, "-").toLowerCase();
+    downloadMarkdown(detail.report.markdown, `${name}-report.md`);
+  }, [detail]);
 
   if (!open || !detail?.report) return null;
 
@@ -51,20 +68,37 @@ export function ReportDrawer() {
               Generated {new Date(detail.report.generated_at).toLocaleString()}
             </div>
           </div>
-          <button
-            onClick={() => setOpen(false)}
-            style={{
-              background: "#1b1b1f",
-              color: "#eee",
-              border: "1px solid #333",
-              padding: "6px 12px",
-              borderRadius: 4,
-              fontSize: 12,
-              cursor: "pointer",
-            }}
-          >
-            ✕ Close
-          </button>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button
+              onClick={handleDownload}
+              style={{
+                background: "#2563eb",
+                color: "#fff",
+                border: "none",
+                padding: "6px 12px",
+                borderRadius: 4,
+                fontSize: 12,
+                cursor: "pointer",
+                fontWeight: 600,
+              }}
+            >
+              Download .md
+            </button>
+            <button
+              onClick={() => setOpen(false)}
+              style={{
+                background: "#1b1b1f",
+                color: "#eee",
+                border: "1px solid #333",
+                padding: "6px 12px",
+                borderRadius: 4,
+                fontSize: 12,
+                cursor: "pointer",
+              }}
+            >
+              Close
+            </button>
+          </div>
         </div>
         <div
           style={{

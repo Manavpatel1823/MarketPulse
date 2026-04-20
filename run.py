@@ -190,7 +190,7 @@ async def main():
         console.print("[dim]Vite frontend dev server: cd frontend && npm run dev[/dim]")
         config = uvicorn.Config(
             "marketpulse.api.app:app",
-            host="127.0.0.1",
+            host="0.0.0.0",
             port=args.port,
             log_level="info",
         )

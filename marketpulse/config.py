@@ -31,3 +31,6 @@ class Settings(BaseSettings):
     # PostgreSQL persistence
     database_url: str = "postgresql://manav:postgres@localhost:5432/marketpulse"
     persist_db: bool = True
+
+    # Deployment
+    cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000"

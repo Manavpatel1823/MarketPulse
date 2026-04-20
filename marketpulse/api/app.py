@@ -30,15 +30,16 @@ from marketpulse.storage import queries as db_queries
 
 
 def _build_llm(settings: Settings) -> LLMBackend:
-    """Build the LLM backend for post-run chat."""
+    """Build the LLM backend from server config."""
     if settings.backend == "openrouter":
         from marketpulse.llm.openrouter_backend import OpenRouterBackend
-        return OpenRouterBackend(
-            api_key=settings.marketpulse_api,
-            model=settings.openrouter_model,
-        )
+        if not settings.marketpulse_api:
+            raise HTTPException(status_code=500, detail="MARKETPULSE_API not configured in .env")
+        return OpenRouterBackend(api_key=settings.marketpulse_api, model=settings.openrouter_model)
     if settings.backend == "gemini":
         from marketpulse.llm.gemini_backend import GeminiBackend
+        if not settings.gemini_api_key:
+            raise HTTPException(status_code=500, detail="GEMINI_API_KEY not configured in .env")
         return GeminiBackend(api_key=settings.gemini_api_key, model=settings.model)
     from marketpulse.llm.ollama_backend import OllamaBackend
     return OllamaBackend(model=settings.ollama_model, base_url=settings.ollama_base_url)
@@ -99,9 +100,11 @@ async def _run_simulation(
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     settings = Settings()
-    app.state.pool = await storage.get_pool(settings.database_url)
+    if settings.database_url:
+        app.state.pool = await storage.get_pool(settings.database_url)
+    else:
+        app.state.pool = None
     app.state.settings = settings
-    app.state.llm = _build_llm(settings)
     try:
         yield
     finally:
@@ -110,14 +113,11 @@ async def _lifespan(app: FastAPI):
 
 app = FastAPI(title="MarketPulse API", lifespan=_lifespan)
 
-# Vite dev server default + common local ports. Loosen only on localhost.
+# CORS origins from env var (comma-separated) or dev defaults.
+_cors_origins = Settings().cors_origins.split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:3000",
-    ],
+    allow_origins=[o.strip() for o in _cors_origins if o.strip()],
     allow_credentials=False,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
@@ -160,7 +160,11 @@ class ChatRequest(BaseModel):
 
 
 @app.post("/runs/{run_id}/agents/{agent_id}/chat")
-async def chat_with_agent(run_id: int, agent_id: int, body: ChatRequest):
+async def chat_with_agent(
+    run_id: int,
+    agent_id: int,
+    body: ChatRequest,
+):
     """Chat with an agent post-run. Reconstructs their full persona and
     history, then generates an in-character response via the LLM."""
     ctx = await db_queries.get_agent_chat_context(
@@ -221,7 +225,7 @@ async def chat_with_agent(run_id: int, agent_id: int, body: ChatRequest):
         f"what convinced you and what didn't."
     )
 
-    llm: LLMBackend = app.state.llm
+    llm = _build_llm(app.state.settings)
     response = await llm.generate(system, body.message)
 
     return {
@@ -239,10 +243,12 @@ async def start_simulation(
     rounds: int = Form(3),
 ):
     """Launch a new simulation. Accepts product name + optional file (PDF/text).
-    Returns immediately with a run_id; connect to /ws/live/{run_id} for events."""
+    Returns immediately with a live_id; connect to /ws/live/{live_id} for events."""
     settings: Settings = app.state.settings
     settings.agent_count = agent_count
     settings.rounds = rounds
+
+    llm = _build_llm(settings)
 
     # Extract text from uploaded file if provided
     brief_text: str | None = None
@@ -257,8 +263,6 @@ async def start_simulation(
 
     # Create an event bus for this simulation
     event_bus = EventBus()
-    # Use a placeholder run_id (the engine will create the real one)
-    # We'll use a counter based on bus registry size
     placeholder_id = len(_active_buses) + 9000
     _active_buses[placeholder_id] = event_bus
 
@@ -266,10 +270,9 @@ async def start_simulation(
     async def _wrapper():
         try:
             await _run_simulation(
-                settings, app.state.llm, product_name, brief_text, event_bus,
+                settings, llm, product_name, brief_text, event_bus,
             )
         finally:
-            # Clean up after simulation completes
             _active_buses.pop(placeholder_id, None)
 
     asyncio.create_task(_wrapper())

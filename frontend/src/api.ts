@@ -106,7 +106,8 @@ export async function startSimulation(
 
 export function createLiveWebSocket(liveId: number): WebSocket {
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  return new WebSocket(`${protocol}//${location.hostname}:8000/ws/live/${liveId}`);
+  const url = `${protocol}//${location.host}/ws/live/${liveId}`;
+  return new WebSocket(url);
 }
 
 export async function fetchRunDetail(runId: number): Promise<RunDetail> {
