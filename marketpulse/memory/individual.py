@@ -7,6 +7,7 @@ class Opinion:
     concerns: list[str]
     positives: list[str]
     reasoning: str
+    aspect_ratings: dict[str, float] = field(default_factory=dict)  # e.g. {"comfort": 7.0, "value": 4.5}
 
 
 @dataclass
@@ -51,6 +52,9 @@ class AgentMemory:
             lines.append(f"Your current sentiment: {op.sentiment}/10")
             lines.append(f"Your concerns: {', '.join(op.concerns)}")
             lines.append(f"Your positives: {', '.join(op.positives)}")
+            if op.aspect_ratings:
+                ratings_str = ", ".join(f"{k}: {v}/10" for k, v in op.aspect_ratings.items())
+                lines.append(f"Your aspect ratings: {ratings_str}")
         if self.recent_interactions:
             lines.append("\nRecent debates:")
             for ir in self.recent_interactions:

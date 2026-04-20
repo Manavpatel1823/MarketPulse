@@ -168,6 +168,17 @@ async def generate_report(results: dict, shared: SharedMemory, llm: LLMBackend) 
     for arch, avg in sorted(results["archetype_sentiments"].items(), key=lambda x: -x[1]):
         summary_lines.append(f"  - {arch}: {avg:+.1f}/10")
 
+    if results.get("aspect_ratings"):
+        summary_lines.append("\nAspect Ratings (panel average, 1-10 scale):")
+        for aspect, avg in sorted(results["aspect_ratings"].items(), key=lambda x: -x[1]):
+            flag = " ⚠ WEAK" if avg < 5.0 else (" ★ STRONG" if avg >= 7.0 else "")
+            summary_lines.append(f"  - {aspect.replace('_', ' ')}: {avg}/10{flag}")
+        if results.get("aspect_by_archetype"):
+            summary_lines.append("\nAspect Ratings by Archetype:")
+            for arch, aspects in sorted(results["aspect_by_archetype"].items()):
+                ratings_str = ", ".join(f"{a}: {v}" for a, v in sorted(aspects.items()))
+                summary_lines.append(f"  {arch}: {ratings_str}")
+
     summary_lines.append("\nAgent Sentiment Journeys:")
     for agent in results["agents"]:
         direction = "improved" if agent["final_sentiment"] > agent["initial_sentiment"] else "declined"
@@ -258,6 +269,12 @@ async def generate_report(results: dict, shared: SharedMemory, llm: LLMBackend) 
         f"7. RECOMMENDATIONS (5 specific actions)\n"
         f"   - Each must reference a specific feature, competitor, "
         f"or distribution band. No 'invest in brand awareness' filler.\n\n"
+        f"8. ASPECT BREAKDOWN\n"
+        f"   - For each rated aspect in the data, state the panel average and what it means.\n"
+        f"   - Flag any aspect below 5.0 as a specific weakness worth addressing.\n"
+        f"   - Flag any aspect at 7.0+ as a strength to leverage in messaging.\n"
+        f"   - Cross-reference: which archetype types rate which aspects lowest/highest?\n"
+        f"   - If no aspect data is available, skip this section.\n\n"
         f"Use the actual numbers and named entities. No filler."
     )
 

@@ -1,3 +1,4 @@
+from marketpulse.agents.criteria import build_criteria_paragraph
 from marketpulse.agents.persona import Persona
 from marketpulse.llm.base import LLMBackend
 from marketpulse.memory.individual import AgentMemory, Opinion, InteractionRecord
@@ -49,15 +50,18 @@ class Agent:
             f"If you're a skeptic or bargain_hunter, be critical and blunt. "
             f"If you're an early_adopter or brand_loyalist, show real enthusiasm."
         )
+        criteria = build_criteria_paragraph(shared.product.category, self.persona.archetype)
         user = (
-            f"{shared.get_agent_briefing(agent_id=self.persona.id)}\n\n"
+            f"{shared.get_agent_briefing(agent_id=self.persona.id, archetype=self.persona.archetype)}\n\n"
+            f"{criteria}\n\n"
             f"{lean}\n\n"
             f"Rate sentiment toward '{shared.product.name}' from -10 (hate) to 10 (love). "
             f"Use the full range — committed skeptics often land at -6 or lower, "
             f"committed enthusiasts at +7 or higher. List your top 3 concerns and "
             f"top 3 positives.\n"
             f"Reply as JSON: {{\"sentiment\": <int>, \"concerns\": [\"...\", \"...\", \"...\"], "
-            f"\"positives\": [\"...\", \"...\", \"...\"], \"reasoning\": \"...\"}}"
+            f"\"positives\": [\"...\", \"...\", \"...\"], "
+            f"\"aspect_ratings\": {{\"aspect_name\": <1-10>, ...}}, \"reasoning\": \"...\"}}"
         )
 
         result = await llm.generate_json(system, user)
@@ -69,11 +73,18 @@ class Agent:
         llm_sentiment = float(result.get("sentiment", 0))
         blended = 0.6 * llm_sentiment + 0.4 * bias_sentiment
 
+        aspect_ratings = {
+            k: max(1.0, min(10.0, float(v)))
+            for k, v in (result.get("aspect_ratings") or {}).items()
+            if isinstance(v, (int, float))
+        }
+
         opinion = Opinion(
             sentiment=blended,
             concerns=result.get("concerns", [])[:3],
             positives=result.get("positives", [])[:3],
             reasoning=result.get("reasoning", ""),
+            aspect_ratings=aspect_ratings,
         )
         self.sentiment = opinion.sentiment
         self.memory.opinions.append(opinion)
@@ -121,13 +132,21 @@ class Agent:
             f"STAY IN CHARACTER. Reflect honestly — keep what still holds, drop "
             f"what got dismissed, surface anything new the debates raised."
         )
+        criteria = build_criteria_paragraph(shared.product.category, self.persona.archetype)
+        prev_aspects = ""
+        if prev.aspect_ratings:
+            prev_aspects = "Your previous aspect ratings: " + ", ".join(
+                f"{k}: {v}" for k, v in prev.aspect_ratings.items()
+            ) + "\n"
         user = (
-            f"{shared.get_agent_briefing(agent_id=self.persona.id)}\n\n"
+            f"{shared.get_agent_briefing(agent_id=self.persona.id, archetype=self.persona.archetype)}\n\n"
+            f"{criteria}\n\n"
             f"Round {round_num + 1} debates:\n{debate_log}\n\n"
             f"Before this round your sentiment was {prev.sentiment:+.1f}/10; "
             f"after the debate math it's now {self.sentiment:+.1f}/10.\n\n"
             f"Your previous concerns: {', '.join(prev.concerns) or 'none'}\n"
-            f"Your previous positives: {', '.join(prev.positives) or 'none'}\n\n"
+            f"Your previous positives: {', '.join(prev.positives) or 'none'}\n"
+            f"{prev_aspects}\n"
             f"Update your top 3 concerns and top 3 positives based on what actually "
             f"came up. Your sentiment can stay, harden (move further from zero), "
             f"or shift — but do NOT drift toward neutral just because the debate "
@@ -136,7 +155,8 @@ class Agent:
             f"negative; a positive agent who heard weak criticism should stay "
             f"positive. Only shift if a debate actually changed your mind.\n\n"
             f"Reply as JSON: {{\"sentiment\": <int>, \"concerns\": [\"...\", \"...\", \"...\"], "
-            f"\"positives\": [\"...\", \"...\", \"...\"], \"reasoning\": \"...\"}}"
+            f"\"positives\": [\"...\", \"...\", \"...\"], "
+            f"\"aspect_ratings\": {{\"aspect_name\": <1-10>, ...}}, \"reasoning\": \"...\"}}"
         )
 
         result = await llm.generate_json(system, user)
@@ -145,11 +165,20 @@ class Agent:
         blended = 0.7 * llm_sentiment + 0.3 * self.sentiment
         blended = max(-10.0, min(10.0, blended))
 
+        aspect_ratings = {
+            k: max(1.0, min(10.0, float(v)))
+            for k, v in (result.get("aspect_ratings") or {}).items()
+            if isinstance(v, (int, float))
+        }
+        # Keep previous ratings for aspects the LLM didn't update
+        merged_aspects = {**prev.aspect_ratings, **aspect_ratings}
+
         opinion = Opinion(
             sentiment=blended,
             concerns=result.get("concerns", prev.concerns)[:3] or prev.concerns,
             positives=result.get("positives", prev.positives)[:3] or prev.positives,
             reasoning=result.get("reasoning", prev.reasoning) or prev.reasoning,
+            aspect_ratings=merged_aspects,
         )
         self.sentiment = opinion.sentiment
         self.memory.opinions.append(opinion)
@@ -166,11 +195,13 @@ class Agent:
         shared_topics: list[str] | None = None,
     ) -> dict:
         own_context = self.memory.get_context_for_prompt()
+        criteria = build_criteria_paragraph(shared.product.category, self.persona.archetype)
 
         system = (
             f"You are {self.persona.name}, age {self.persona.age}, "
             f"a {self.persona.archetype} consumer. "
             f"{self.persona.personality_blurb}\n"
+            f"{criteria}\n"
             f"{own_context}"
         )
         topic_hint = ""

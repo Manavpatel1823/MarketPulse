@@ -284,13 +284,14 @@ async def get_resume_state(
     sm_block = None
     if sm:
         sm_dict = _decode(dict(sm), "product_json", "competitors_json",
-                          "findings_json", "signals_json")
+                          "findings_json", "signals_json", "graph_json")
         sm_block = {
             "product": sm_dict.get("product_json"),
             "competitors": sm_dict.get("competitors_json") or [],
             "findings": sm_dict.get("findings_json") or [],
             "market_context": sm_dict.get("market_context"),
             "signals": sm_dict.get("signals_json"),
+            "graph": sm_dict.get("graph_json"),
         }
 
     run_dict = _decode(dict(run), "settings_json")
@@ -376,3 +377,125 @@ async def compare_runs(
             )[:3]
             out.append(row)
     return out
+
+
+async def list_agents(pool: asyncpg.Pool, run_id: int) -> list[dict[str, Any]] | None:
+    """List all agents in a run with summary info for the chat selector."""
+    async with pool.acquire() as conn:
+        run = await conn.fetchval("SELECT id FROM runs WHERE id = $1", run_id)
+        if run is None:
+            return None
+        agents = await conn.fetch(
+            """
+            SELECT id, persona_id, name, archetype, age, income_bracket,
+                   initial_bias, initial_sentiment, final_sentiment,
+                   conversion_count
+              FROM agents
+             WHERE run_id = $1
+             ORDER BY final_sentiment DESC NULLS LAST
+            """,
+            run_id,
+        )
+    return [dict(a) for a in agents]
+
+
+async def get_agent_chat_context(
+    pool: asyncpg.Pool, run_id: int, agent_db_id: int
+) -> dict[str, Any] | None:
+    """Pull everything needed to chat with an agent post-run.
+
+    Returns the agent's persona, full opinion history across rounds,
+    all debate interactions (arguments, stances, shifts), and the
+    knowledge graph if available.
+    """
+    async with pool.acquire() as conn:
+        agent = await conn.fetchrow(
+            """
+            SELECT id, persona_id, name, archetype, age, income_bracket,
+                   initial_bias, initial_sentiment, final_sentiment,
+                   conversion_count
+              FROM agents
+             WHERE run_id = $1 AND id = $2
+            """,
+            run_id, agent_db_id,
+        )
+        if not agent:
+            return None
+
+        run = await conn.fetchrow(
+            "SELECT product_name, rounds FROM runs WHERE id = $1", run_id,
+        )
+
+        # Full opinion history (all rounds)
+        opinions = await conn.fetch(
+            """
+            SELECT round_num, sentiment, reasoning, concerns_json, positives_json
+              FROM opinions
+             WHERE run_id = $1 AND agent_id = $2
+             ORDER BY round_num
+            """,
+            run_id, agent_db_id,
+        )
+
+        # All debate interactions this agent participated in
+        interactions = await conn.fetch(
+            """
+            SELECT i.round_num,
+                   CASE WHEN i.agent_a_id = $2 THEN b.name ELSE a.name END AS opponent_name,
+                   CASE WHEN i.agent_a_id = $2 THEN b.archetype ELSE a.archetype END AS opponent_archetype,
+                   CASE WHEN i.agent_a_id = $2 THEN i.a_stance ELSE i.b_stance END AS my_stance,
+                   CASE WHEN i.agent_a_id = $2 THEN i.b_stance ELSE i.a_stance END AS opponent_stance,
+                   CASE WHEN i.agent_a_id = $2 THEN i.a_argument ELSE i.b_argument END AS my_argument,
+                   CASE WHEN i.agent_a_id = $2 THEN i.b_argument ELSE i.a_argument END AS opponent_argument,
+                   CASE WHEN i.agent_a_id = $2 THEN i.a_shift ELSE i.b_shift END AS my_shift,
+                   CASE WHEN i.agent_a_id = $2 THEN i.a_convinced ELSE i.b_convinced END AS was_convinced
+              FROM interactions i
+              JOIN agents a ON a.id = i.agent_a_id
+              JOIN agents b ON b.id = i.agent_b_id
+             WHERE i.run_id = $1
+               AND (i.agent_a_id = $2 OR i.agent_b_id = $2)
+             ORDER BY i.round_num, i.id
+            """,
+            run_id, agent_db_id,
+        )
+
+        # Shared memory for product context
+        sm = await conn.fetchrow(
+            "SELECT product_json, graph_json FROM shared_memory WHERE run_id = $1",
+            run_id,
+        )
+
+        # Final report (for context)
+        report = await conn.fetchval(
+            "SELECT markdown FROM reports WHERE run_id = $1", run_id,
+        )
+
+    opinion_list = []
+    for o in opinions:
+        opinion_list.append({
+            "round_num": o["round_num"],
+            "sentiment": o["sentiment"],
+            "reasoning": o["reasoning"],
+            "concerns": json.loads(o["concerns_json"] or "[]"),
+            "positives": json.loads(o["positives_json"] or "[]"),
+        })
+
+    interaction_list = [dict(i) for i in interactions]
+
+    product_json = None
+    graph_json = None
+    if sm:
+        sm_decoded = _decode(dict(sm), "product_json", "graph_json")
+        product_json = sm_decoded.get("product_json")
+        graph_json = sm_decoded.get("graph_json")
+
+    return {
+        "agent": dict(agent),
+        "product_name": run["product_name"] if run else "",
+        "total_rounds": run["rounds"] if run else 0,
+        "opinions": opinion_list,
+        "interactions": interaction_list,
+        "product": product_json,
+        "graph": graph_json,
+        "report_summary": (report or "")[:500] if report else None,
+    }

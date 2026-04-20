@@ -123,6 +123,8 @@ async def enrich_competitor_briefs(shared: SharedMemory, llm) -> SharedMemory:
                 if f.lower() not in existing:
                     c.key_features.append(f)
                     existing.add(f.lower())
+    # Rebuild graph with enriched competitor positioning
+    shared.build_knowledge_graph()
     return shared
 
 
@@ -178,13 +180,15 @@ async def research_product(name: str, llm) -> SharedMemory:
 
     extracted = await parser.extract(snippets, name, llm)
 
-    return SharedMemory(
+    shared = SharedMemory(
         product=_product_from_extracted(name, extracted.product),
         competitors=[_competitor_from_extracted(c) for c in extracted.competitors],
         research_findings=[_finding_from_extracted(f) for f in extracted.findings],
         market_context=extracted.market_context,
         signals=extracted.signals,
     )
+    shared.build_knowledge_graph()
+    return shared
 
 
 async def augment_with_category_competitors(
@@ -264,4 +268,6 @@ async def augment_with_category_competitors(
         existing.add(nm.lower())
 
     shared.competitors.extend(new_competitors)
+    # Rebuild graph with the newly discovered competitors
+    shared.build_knowledge_graph()
     return shared

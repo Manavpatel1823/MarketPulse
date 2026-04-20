@@ -83,8 +83,54 @@ export interface RunDetail {
   agents: any[];
 }
 
+export interface SimulateResponse {
+  status: string;
+  live_id: number;
+}
+
+export async function startSimulation(
+  productName: string,
+  file: File | null,
+  agentCount: number,
+  rounds: number,
+): Promise<SimulateResponse> {
+  const form = new FormData();
+  form.append("product_name", productName);
+  form.append("agent_count", String(agentCount));
+  form.append("rounds", String(rounds));
+  if (file) form.append("file", file);
+  const r = await fetch(`${BASE}/simulate`, { method: "POST", body: form });
+  if (!r.ok) throw new Error(`simulate ${r.status}`);
+  return r.json();
+}
+
+export function createLiveWebSocket(liveId: number): WebSocket {
+  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  return new WebSocket(`${protocol}//${location.hostname}:8000/ws/live/${liveId}`);
+}
+
 export async function fetchRunDetail(runId: number): Promise<RunDetail> {
   const r = await fetch(`${BASE}/runs/${runId}`);
   if (!r.ok) throw new Error(`detail ${r.status}`);
+  return r.json();
+}
+
+export interface ChatResponse {
+  agent_name: string;
+  archetype: string;
+  response: string;
+}
+
+export async function chatWithAgent(
+  runId: number,
+  agentId: number,
+  message: string,
+): Promise<ChatResponse> {
+  const r = await fetch(`${BASE}/runs/${runId}/agents/${agentId}/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message }),
+  });
+  if (!r.ok) throw new Error(`chat ${r.status}`);
   return r.json();
 }

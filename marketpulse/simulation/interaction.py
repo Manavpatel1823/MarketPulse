@@ -3,9 +3,9 @@ import re
 from marketpulse.agents.agent import Agent
 
 
-# Words stripped before computing topical overlap — generic filler that shows
+# Words stripped before computing topical overlap — generic filler that shows 
 # up in nearly every opinion and would inflate overlap scores meaninglessly.
-_STOPWORDS = {
+_STOPWORDS = { 
     "the", "and", "for", "with", "that", "this", "but", "not", "you", "are",
     "have", "has", "had", "will", "would", "could", "should", "from", "about",
     "their", "there", "which", "what", "when", "where", "more", "less", "than",

@@ -24,6 +24,7 @@ from marketpulse.memory.shared import (
     SharedMemory,
 )
 from marketpulse.reporting.analyzer import generate_report
+from marketpulse.simulation.events import EventBus, EventType, SimEvent
 from marketpulse.simulation.interaction import adversarial_pairing
 from marketpulse.simulation.sentiment import apply_persuasion
 from marketpulse.storage import db as storage
@@ -35,12 +36,13 @@ console = Console(record=True)
 
 
 class SimulationEngine:
-    def __init__(self, settings: Settings, llm: LLMBackend):
+    def __init__(self, settings: Settings, llm: LLMBackend, event_bus: EventBus | None = None):
         self.settings = settings
         self.llm = llm
         self.pool = AgentPool(batch_size=settings.batch_size)
         self.agents: list[Agent] = []
         self.previous_pairs: set[tuple[str, str]] = set()
+        self.events = event_bus or EventBus()
         # DB state — populated in run() if persist_db=True. None means "no DB".
         self._db_pool = None
         self._run_id: int | None = None
@@ -69,6 +71,18 @@ class SimulationEngine:
         )
 
         self.agents = [Agent(p) for p in personas]
+
+        # Emit agent_created events for live UI
+        for a in self.agents:
+            await self.events.emit(SimEvent(EventType.AGENT_CREATED, {
+                "persona_id": a.persona.id, "name": a.persona.name,
+                "archetype": a.persona.archetype, "age": a.persona.age,
+                "income_bracket": a.persona.income_bracket,
+                "initial_bias": a.persona.initial_bias,
+            }))
+        await self.events.emit(SimEvent(EventType.AGENTS_READY, {
+            "count": len(self.agents),
+        }))
 
         # Show each agent's personality
         for a in self.agents:
@@ -109,6 +123,19 @@ class SimulationEngine:
                 batch_results = await self.pool.execute_batch(batch)
                 results.extend(batch_results)
                 progress.update(ptask, completed=len(results))
+                # Emit opinion events for completed batch
+                for j, agent in enumerate(self.agents[i : i + len(batch)]):
+                    op = agent.memory.latest_opinion
+                    if op:
+                        await self.events.emit(SimEvent(EventType.OPINION_FORMED, {
+                            "persona_id": agent.persona.id, "name": agent.persona.name,
+                            "sentiment": round(op.sentiment, 2),
+                            "concerns": op.concerns, "positives": op.positives,
+                            "reasoning": op.reasoning,
+                        }))
+        await self.events.emit(SimEvent(EventType.OPINIONS_DONE, {
+            "count": len(self.agents),
+        }))
 
         # Show each agent's opinion in detail
         for a in self.agents:
@@ -141,6 +168,9 @@ class SimulationEngine:
     async def debate_round(self, shared: SharedMemory, round_num: int) -> None:
         """Run one round of debates with full conversation display."""
         pairs = adversarial_pairing(self.agents, self.previous_pairs)
+        await self.events.emit(SimEvent(EventType.ROUND_STARTED, {
+            "round": round_num + 1, "pairs": len(pairs),
+        }))
         console.print(
             f"\n[bold cyan]═══ DEBATE ROUND {round_num + 1} ═══[/bold cyan]"
         )
@@ -207,6 +237,29 @@ class SimulationEngine:
                 console.print(f"\n  [bold yellow]*** {b.persona.name} CONVERTED! "
                               f"{b_old:+.1f} → {b.sentiment:+.1f} ***[/bold yellow]")
 
+            # Emit debate result to live UI
+            await self.events.emit(SimEvent(EventType.DEBATE_RESULT, {
+                "round": round_num + 1, "pair": pair_idx + 1,
+                "a": {"persona_id": a.persona.id, "name": a.persona.name,
+                      "archetype": a.persona.archetype,
+                      "sentiment_before": round(a_old, 2),
+                      "sentiment_after": round(a.sentiment, 2),
+                      "stance": a_result.get("stance", ""),
+                      "argument": a_result.get("counter_argument", ""),
+                      "shift": float(a_result.get("sentiment_shift", 0)),
+                      "convinced": bool(a_result.get("convinced", False)),
+                      "converted": a_converted},
+                "b": {"persona_id": b.persona.id, "name": b.persona.name,
+                      "archetype": b.persona.archetype,
+                      "sentiment_before": round(b_old, 2),
+                      "sentiment_after": round(b.sentiment, 2),
+                      "stance": b_result.get("stance", ""),
+                      "argument": b_result.get("counter_argument", ""),
+                      "shift": float(b_result.get("sentiment_shift", 0)),
+                      "convinced": bool(b_result.get("convinced", False)),
+                      "converted": b_converted},
+            }))
+
             # Show post-debate sentiment
             console.print(f"\n  [dim]After debate: {a.persona.name} {a_old:+.1f}→{a.sentiment:+.1f} | "
                           f"{b.persona.name} {b_old:+.1f}→{b.sentiment:+.1f}[/dim]")
@@ -230,6 +283,12 @@ class SimulationEngine:
 
         console.print(f"[yellow]Round {round_num + 1} conversions: {conversions}[/yellow]")
         self._print_sentiment_table(f"After Round {round_num + 1}")
+
+        await self.events.emit(SimEvent(EventType.ROUND_COMPLETE, {
+            "round": round_num + 1,
+            "conversions": conversions,
+            "sentiments": {a.persona.id: round(a.sentiment, 2) for a in self.agents},
+        }))
 
         if self._db_pool and self._run_id and interaction_rows:
             await storage.insert_interactions_batch(
@@ -299,6 +358,13 @@ class SimulationEngine:
                 self._db_pool = None
                 self._run_id = None
 
+        await self.events.emit(SimEvent(EventType.SIM_STARTED, {
+            "run_id": self._run_id,
+            "product": shared.product.name,
+            "agent_count": self.settings.agent_count,
+            "rounds": self.settings.rounds,
+        }))
+
         try:
             # Phase 1: Initialize agents
             await self.initialize_agents(shared)
@@ -322,6 +388,7 @@ class SimulationEngine:
             self._print_final_summary(results)
 
             # Phase 4: Generate marketing report
+            await self.events.emit(SimEvent(EventType.REPORT_STARTED, {}))
             console.print("\n[bold cyan]═══ GENERATING MARKETING REPORT ═══[/bold cyan]")
             with Progress(
                 SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
@@ -336,12 +403,24 @@ class SimulationEngine:
             console.print("[bold magenta]╚══════════════════════════════════════════╝[/bold magenta]\n")
             console.print(report)
             results["report"] = report
+            await self.events.emit(SimEvent(EventType.REPORT_READY, {
+                "report": report,
+                "mean_sentiment": results["average_sentiment"],
+                "polarization": results.get("distribution", {}).get("polarization_index", 0),
+                "total_conversions": results["total_conversions"],
+            }))
 
             # Save run outputs to disk (debate transcript, report, structured summary)
             self._save_run_outputs(shared, results, report, folder_name)
 
             # Finalize DB row last — only "complete" if everything succeeded.
             await self._finalize_db(results)
+
+            await self.events.emit(SimEvent(EventType.SIM_COMPLETE, {
+                "run_id": self._run_id,
+                "mean_sentiment": results["average_sentiment"],
+                "distribution": results.get("distribution", {}),
+            }))
 
             return results
         finally:
@@ -453,6 +532,9 @@ class SimulationEngine:
             price=p.get("price", ""),
             features=p.get("features", []) or [],
             category=p.get("category", ""),
+            detailed_description=p.get("detailed_description", ""),
+            risks=p.get("risks", []) or [],
+            target_audience=p.get("target_audience", ""),
         )
         competitors = [
             CompetitorInfo(
@@ -460,6 +542,7 @@ class SimulationEngine:
                 description=c.get("description", ""),
                 price=c.get("price", ""),
                 key_features=c.get("key_features", []) or [],
+                positioning=c.get("positioning", ""),
             )
             for c in sm.get("competitors") or []
         ]
@@ -480,13 +563,21 @@ class SimulationEngine:
                 category_maturity=s.get("category_maturity", "established"),
                 price_position=s.get("price_position", "parity"),
             )
-        return SharedMemory(
+        shared = SharedMemory(
             product=product,
             competitors=competitors,
             research_findings=findings,
             market_context=sm.get("market_context") or "",
             signals=signals,
         )
+        # Rebuild knowledge graph from persisted data (or from graph_json if stored)
+        graph_data = sm.get("graph")
+        if graph_data:
+            from marketpulse.knowledge.graph import KnowledgeGraph
+            shared.knowledge_graph = KnowledgeGraph.from_dict(graph_data)
+        else:
+            shared.build_knowledge_graph()
+        return shared
 
     def _rebuild_agents(self, agent_blocks: list[dict]) -> tuple[list[Agent], dict[str, int]]:
         """Reconstruct Agent objects from DB rows.
@@ -715,6 +806,31 @@ class SimulationEngine:
                 archetype_sentiments[arch] = []
             archetype_sentiments[arch].append(a.sentiment)
 
+        # Aggregate aspect ratings — panel-wide and per-archetype
+        all_aspect_ratings: dict[str, list[float]] = {}
+        archetype_aspects: dict[str, dict[str, list[float]]] = {}
+        for a in self.agents:
+            if a.memory.latest_opinion and a.memory.latest_opinion.aspect_ratings:
+                arch = a.persona.archetype
+                if arch not in archetype_aspects:
+                    archetype_aspects[arch] = {}
+                for aspect, rating in a.memory.latest_opinion.aspect_ratings.items():
+                    all_aspect_ratings.setdefault(aspect, []).append(rating)
+                    archetype_aspects[arch].setdefault(aspect, []).append(rating)
+
+        aspect_summary = {
+            aspect: round(sum(ratings) / len(ratings), 1)
+            for aspect, ratings in sorted(all_aspect_ratings.items())
+            if ratings
+        }
+        aspect_by_archetype = {
+            arch: {
+                aspect: round(sum(r) / len(r), 1)
+                for aspect, r in sorted(aspects.items()) if r
+            }
+            for arch, aspects in archetype_aspects.items()
+        }
+
         return {
             "product": shared.product.name,
             "brand_tier": shared.signals.brand_tier if shared.signals else None,
@@ -730,6 +846,8 @@ class SimulationEngine:
                 k: round(sum(v) / len(v), 2)
                 for k, v in archetype_sentiments.items()
             },
+            "aspect_ratings": aspect_summary,
+            "aspect_by_archetype": aspect_by_archetype,
             "agents": [
                 {
                     "id": a.persona.id,

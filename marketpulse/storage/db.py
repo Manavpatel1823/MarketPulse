@@ -56,7 +56,8 @@ CREATE TABLE IF NOT EXISTS shared_memory (
     competitors_json JSONB,
     findings_json   JSONB,
     market_context  TEXT,
-    signals_json    JSONB
+    signals_json    JSONB,
+    graph_json      JSONB
 );
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -81,7 +82,8 @@ CREATE TABLE IF NOT EXISTS opinions (
     sentiment       DOUBLE PRECISION NOT NULL,
     reasoning       TEXT,
     concerns_json   JSONB,
-    positives_json  JSONB
+    positives_json  JSONB,
+    aspect_ratings_json JSONB
 );
 
 CREATE TABLE IF NOT EXISTS reports (
@@ -105,6 +107,18 @@ CREATE TABLE IF NOT EXISTS interactions (
     a_argument      TEXT,
     b_argument      TEXT
 );
+
+-- Phase 4.5: add graph_json column if missing (idempotent migration)
+DO $$ BEGIN
+    ALTER TABLE shared_memory ADD COLUMN IF NOT EXISTS graph_json JSONB;
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;
+
+-- Phase 5: add aspect_ratings_json column to opinions (idempotent migration)
+DO $$ BEGIN
+    ALTER TABLE opinions ADD COLUMN IF NOT EXISTS aspect_ratings_json JSONB;
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;
 
 CREATE INDEX IF NOT EXISTS idx_runs_product  ON runs(product_name);
 CREATE INDEX IF NOT EXISTS idx_runs_started  ON runs(started_at DESC);
@@ -183,10 +197,14 @@ async def insert_shared_memory(
     product = {
         "name": p.name, "description": p.description, "price": p.price,
         "features": p.features, "category": p.category,
+        "detailed_description": p.detailed_description,
+        "risks": p.risks,
+        "target_audience": p.target_audience,
     }
     competitors = [
         {"name": c.name, "description": c.description,
-         "price": c.price, "key_features": c.key_features}
+         "price": c.price, "key_features": c.key_features,
+         "positioning": c.positioning}
         for c in shared.competitors
     ]
     findings = [
@@ -201,10 +219,13 @@ async def insert_shared_memory(
             "category_maturity": shared.signals.category_maturity,
             "price_position": shared.signals.price_position,
         }
+    graph_data = None
+    if shared.knowledge_graph is not None:
+        graph_data = _j(shared.knowledge_graph.to_dict())
     sql = """
         INSERT INTO shared_memory
-            (run_id, product_json, competitors_json, findings_json, market_context, signals_json)
-        VALUES ($1, $2::jsonb, $3::jsonb, $4::jsonb, $5, $6::jsonb)
+            (run_id, product_json, competitors_json, findings_json, market_context, signals_json, graph_json)
+        VALUES ($1, $2::jsonb, $3::jsonb, $4::jsonb, $5, $6::jsonb, $7::jsonb)
         ON CONFLICT (run_id) DO NOTHING
     """
     async with pool.acquire() as conn:
@@ -212,6 +233,7 @@ async def insert_shared_memory(
             sql, run_id, _j(product), _j(competitors),
             _j(findings), shared.market_context,
             _j(signals) if signals else None,
+            graph_data,
         )
 
 
@@ -247,14 +269,15 @@ async def insert_opinion(
         return
     sql = """
         INSERT INTO opinions
-            (run_id, agent_id, round_num, sentiment, reasoning, concerns_json, positives_json)
-        VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb)
+            (run_id, agent_id, round_num, sentiment, reasoning, concerns_json, positives_json, aspect_ratings_json)
+        VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8::jsonb)
     """
     async with pool.acquire() as conn:
         await conn.execute(
             sql, run_id, agent_db_id, round_num,
             opinion.sentiment, opinion.reasoning,
             _j(opinion.concerns), _j(opinion.positives),
+            _j(opinion.aspect_ratings) if opinion.aspect_ratings else None,
         )
 
 
@@ -270,13 +293,14 @@ async def insert_opinions_batch(
         payload.append((
             run_id, agent_db_id, round_num, op.sentiment,
             op.reasoning, _j(op.concerns), _j(op.positives),
+            _j(op.aspect_ratings) if op.aspect_ratings else None,
         ))
     if not payload:
         return
     sql = """
         INSERT INTO opinions
-            (run_id, agent_id, round_num, sentiment, reasoning, concerns_json, positives_json)
-        VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb)
+            (run_id, agent_id, round_num, sentiment, reasoning, concerns_json, positives_json, aspect_ratings_json)
+        VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8::jsonb)
     """
     async with pool.acquire() as conn:
         async with conn.transaction():

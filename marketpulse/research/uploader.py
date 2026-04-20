@@ -190,13 +190,17 @@ async def from_text(name: str, text: str, llm) -> SharedMemory:
             )
         )
 
-    return SharedMemory(
+    shared = SharedMemory(
         product=product,
         competitors=competitors,
         research_findings=findings,
         market_context=raw.get("market_context", "") or "",
         signals=_signals_from_raw(raw),
     )
+    shared._raw_source_text = text  # preserve for entity extraction
+    shared.build_knowledge_graph()
+    await shared.enrich_graph_from_text(llm)
+    return shared
 
 
 async def from_url(name: str, url: str, llm) -> SharedMemory:

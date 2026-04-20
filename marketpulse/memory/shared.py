@@ -1,5 +1,11 @@
+from __future__ import annotations
+
 import random
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from marketpulse.knowledge.graph import KnowledgeGraph
 
 
 @dataclass
@@ -50,8 +56,35 @@ class SharedMemory:
     research_findings: list[ResearchFinding] = field(default_factory=list)
     market_context: str = ""
     signals: MarketSignals | None = None
+    knowledge_graph: KnowledgeGraph | None = None
 
-    def get_agent_briefing(self, agent_id: str | None = None) -> str:
+    # Raw source text — kept for entity extraction. Set by uploader/from_text
+    # but not persisted or sent to agents. None for web-research path.
+    _raw_source_text: str | None = field(default=None, repr=False)
+
+    def build_knowledge_graph(self) -> None:
+        """Build (or rebuild) the knowledge graph from current research data."""
+        from marketpulse.knowledge.graph import KnowledgeGraph
+        self.knowledge_graph = KnowledgeGraph.from_shared_memory(self)
+
+    async def enrich_graph_from_text(self, llm) -> None:
+        """Run LLM entity extraction on raw source text and merge into graph.
+
+        Only runs if _raw_source_text is available (i.e. from-file or from-url
+        path, not web research). Builds the base graph first if needed.
+        """
+        if not self._raw_source_text:
+            return
+        if self.knowledge_graph is None:
+            self.build_knowledge_graph()
+        from marketpulse.knowledge.extractor import extract_entities
+        extraction = await extract_entities(
+            self._raw_source_text, self.product.name, llm,
+        )
+        if extraction.entities:
+            self.knowledge_graph.enrich_from_extraction(extraction)
+
+    def get_agent_briefing(self, agent_id: str | None = None, archetype: str | None = None) -> str:
         """Render the briefing. If agent_id is given, the feature list and
         research findings are shuffled with a per-agent deterministic seed
         so primacy bias doesn't push every agent toward the same first
@@ -94,4 +127,11 @@ class SharedMemory:
                 lines.append(f"- [{f.sentiment}] {f.summary}")
         if self.market_context:
             lines.append(f"\nMarket Context: {self.market_context}")
+        # Graph-derived competitive intelligence, tailored to archetype
+        if self.knowledge_graph is not None and archetype:
+            graph_ctx = self.knowledge_graph.get_agent_graph_context(
+                self.product.name, archetype,
+            )
+            if graph_ctx:
+                lines.append(f"\nCompetitive Intelligence:\n{graph_ctx}")
         return "\n".join(lines)

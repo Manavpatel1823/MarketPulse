@@ -2,9 +2,11 @@ import { GraphCanvas } from "./canvas/GraphCanvas";
 import { GraphCanvas3D } from "./canvas/GraphCanvas3D";
 import { AgentDetail } from "./controls/AgentDetail";
 import { Legend } from "./controls/Legend";
+import { LiveSimulation } from "./controls/LiveSimulation";
 import { ProductHeader } from "./controls/ProductHeader";
 import { ReportDrawer } from "./controls/ReportDrawer";
 import { RunPicker } from "./controls/RunPicker";
+import { StartSimulation } from "./controls/StartSimulation";
 import { Timeline } from "./controls/Timeline";
 import { ViewToggle } from "./controls/ViewToggle";
 import { useStore } from "./store";
@@ -14,14 +16,37 @@ export default function App() {
   const error = useStore((s) => s.error);
   const graph = useStore((s) => s.graph);
   const viewMode = useStore((s) => s.viewMode);
+  const simPhase = useStore((s) => s.simPhase);
+  const selectedRunId = useStore((s) => s.selectedRunId);
+
+  const isLive = simPhase !== "idle";
+  const isBrowsing = selectedRunId !== null;
+
+  // Three modes: launch page, live simulation, or browsing past runs
+  if (isLive) {
+    return (
+      <div className="app">
+        <header className="topbar">
+          <div className="brand">MarketPulse</div>
+          <div className="spacer" />
+          <span style={{ color: "#888", fontSize: 12 }}>
+            Live Simulation
+          </span>
+        </header>
+        <main className="canvas-wrap">
+          <LiveSimulation />
+        </main>
+      </div>
+    );
+  }
 
   return (
     <div className="app">
       <header className="topbar">
-        <div className="brand">MarketPulse Space</div>
+        <div className="brand">MarketPulse</div>
         <RunPicker />
         <div className="spacer" />
-        {loading && <span style={{ color: "#888" }}>loading…</span>}
+        {loading && <span style={{ color: "#888" }}>loading...</span>}
         {error && <span style={{ color: "#c24b4b" }}>{error}</span>}
         {graph && (
           <span style={{ color: "#888", fontSize: 12 }}>
@@ -30,14 +55,20 @@ export default function App() {
         )}
       </header>
       <main className="canvas-wrap">
-        {viewMode === "2d" ? <GraphCanvas /> : <GraphCanvas3D />}
-        <ProductHeader />
-        <Legend />
-        <AgentDetail />
-        <ViewToggle />
+        {!isBrowsing ? (
+          <StartSimulation />
+        ) : (
+          <>
+            {viewMode === "2d" ? <GraphCanvas /> : <GraphCanvas3D />}
+            <ProductHeader />
+            <Legend />
+            <AgentDetail />
+            <ViewToggle />
+          </>
+        )}
       </main>
-      <Timeline />
-      <ReportDrawer />
+      {isBrowsing && <Timeline />}
+      {isBrowsing && <ReportDrawer />}
     </div>
   );
 }

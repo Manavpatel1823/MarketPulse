@@ -106,52 +106,76 @@ def _print_research_summary(shared: SharedMemory) -> None:
 
 
 async def main():
-    ap = argparse.ArgumentParser(description="MarketPulse — AI consumer panel simulation")
+    ap = argparse.ArgumentParser(
+        description="MarketPulse — AI consumer panel simulation",
+        epilog=(
+            "EXAMPLES:\n"
+            "  %(prog)s \"Fairphone 5\"                   # web search → sim (default)\n"
+            "  %(prog)s \"MyProduct\" --from-file brief.txt # your brief + web competitors\n"
+            "  %(prog)s \"MyProduct\" --from-url https://.. # fetch page + web competitors\n"
+            "  %(prog)s \"MyProduct\" --no-research         # offline stub, no LLM research\n"
+            "  %(prog)s --list                             # view past runs\n"
+            "  %(prog)s --show 7                           # full detail of run #7\n"
+            "  %(prog)s --compare 3 7                      # side-by-side comparison\n"
+            "  %(prog)s --serve                            # start web UI API server\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     ap.add_argument(
         "product",
         nargs="?",
         help="Product name to research (e.g. 'Fairphone 5'). "
-             "Omit when using --list / --show / --compare.",
+             "Omit when using --list / --show / --compare / --serve.",
     )
     # DB-backed inspection commands. Mutually exclusive with running a sim.
     ap.add_argument("--list", dest="list_runs", action="store_true",
                     help="List recent runs from the database and exit.")
     ap.add_argument("--show", type=int, metavar="RUN_ID",
-                    help="Show full detail for one run from the database and exit.")
+                    help="Show full detail for one run (distribution, agents, report).")
     ap.add_argument("--compare", type=int, nargs="+", metavar="RUN_ID",
-                    help="Compare 2+ runs side-by-side and exit.")
+                    help="Compare 2+ runs side-by-side (concerns, sentiment, distribution).")
     ap.add_argument("--resume", type=int, metavar="RUN_ID",
-                    help="Resume a crashed run from its last persisted round. "
-                         "Rebuilds agents + shared memory from DB.")
+                    help="Resume a crashed/incomplete run from its last persisted round. "
+                         "Rebuilds agents + shared memory from DB, then continues debate.")
     ap.add_argument("--serve", action="store_true",
-                    help="Start the visualization API on localhost:8000 and exit.")
+                    help="Start the FastAPI visualization server (default port 8000). "
+                         "Run 'cd frontend && npm run dev' in a second terminal for the UI.")
     ap.add_argument("--port", type=int, default=8000,
                     help="Port for --serve (default: 8000).")
     src = ap.add_mutually_exclusive_group()
     src.add_argument(
         "--no-research",
         action="store_true",
-        help="Skip web research; use a minimal stub (for offline/deterministic testing)",
+        help="Skip ALL research — run with a bare stub (product name only). "
+             "Useful for offline testing or deterministic runs.",
     )
     src.add_argument(
         "--from-url",
         metavar="URL",
-        help="Skip web search; fetch this URL, compress its text into ProductInfo via LLM",
+        help="Fetch this URL, extract product info via LLM, then web-search "
+             "the inferred CATEGORY for real competitors + positioning briefs. "
+             "Use when the product has a public page but limited reviews.",
     )
     src.add_argument(
         "--from-file",
         metavar="PATH",
-        help="Skip web search; read this file's text and compress into ProductInfo via LLM",
+        help="Read a local brief file (plain text), extract product info via LLM, "
+             "then web-search the inferred CATEGORY for real competitors + "
+             "positioning briefs. Best for unreleased/internal products — write "
+             "a brief with features, price, risks, target audience, and known "
+             "competitors. The brief's risks are shown directly to agents.",
     )
     ap.add_argument(
         "--force-research",
         action="store_true",
-        help="Skip the 'is research worthwhile?' gate and run web research no matter what",
+        help="Skip the 'is research worthwhile?' pre-check and run web search "
+             "regardless. Use when the gate incorrectly rejects a known product.",
     )
     ap.add_argument(
         "-y", "--yes",
         action="store_true",
-        help="Auto-confirm the research findings prompt (skip Y/n, useful for scripting)",
+        help="Auto-confirm the research findings prompt (skip the Y/n gate). "
+             "Useful for scripting or CI pipelines.",
     )
     args = ap.parse_args()
     settings = Settings()
